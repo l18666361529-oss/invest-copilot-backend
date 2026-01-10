@@ -3,7 +3,7 @@ import cors from "cors";
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 /* =========================
    基础
@@ -22,7 +22,7 @@ app.get("/api/debug/time", (_req, res) => {
 });
 
 /* =========================
-   工具函数：fetch + 超时 + 重试
+   工具：fetch + 超时 + 重试
 ========================= */
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -55,21 +55,20 @@ async function fetchText(url, { timeoutMs = 9000, retries = 1 } = {}) {
     } catch (e) {
       clearTimeout(t);
       lastErr = e;
-      if (i < retries) await sleep(300 * (i + 1));
+      if (i < retries) await sleep(350 * (i + 1));
     }
   }
 
-  return {
-    ok: false,
-    status: 0,
-    text: "",
-    error: String(lastErr?.message || lastErr)
-  };
+  return { ok: false, status: 0, text: "", error: String(lastErr?.message || lastErr) };
 }
 
 function safeNum(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
+}
+
+function clamp(n, a, b) {
+  return Math.max(a, Math.min(b, n));
 }
 
 /* =========================
@@ -109,7 +108,7 @@ function pickNameFromPingzhongdata(jsText) {
 
 /* =========================
    国内基金：/api/cn/fund/:code
-   多源容错：lsjz(官方) + pingzhongdata(官方备用) + fundgz(估值)
+   多源：lsjz(官方净值) + pingzhongdata(官方备用) + fundgz(估值)
 ========================= */
 app.get("/api/cn/fund/:code", async (req, res) => {
   const code = String(req.params.code || "").trim();
@@ -122,7 +121,6 @@ app.get("/api/cn/fund/:code", async (req, res) => {
     `&pageIndex=1&pageSize=1&callback=cb&_=${Date.now()}`;
 
   const pzdUrl = `https://fund.eastmoney.com/pingzhongdata/${code}.js?v=${Date.now()}`;
-
   const fundgzUrl = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
 
   const out = {
@@ -142,7 +140,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
 
   // A) lsjz（官方净值）
   try {
-    const r = await fetchText(lsjzUrl, { timeoutMs: 9000, retries: 1 });
+    const r = await fetchText(lsjzUrl, { timeoutMs: 9500, retries: 1 });
     debug.lsjz = { ok: r.ok, status: r.status };
 
     if (r.ok && r.text) {
@@ -171,7 +169,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
 
   // B) pingzhongdata（官方备用）
   try {
-    const r = await fetchText(pzdUrl, { timeoutMs: 9000, retries: 1 });
+    const r = await fetchText(pzdUrl, { timeoutMs: 9500, retries: 1 });
     debug.pingzhongdata = { ok: r.ok, status: r.status };
 
     if (r.ok && r.text) {
@@ -190,9 +188,9 @@ app.get("/api/cn/fund/:code", async (req, res) => {
     debug.pingzhongdata = { ok: false, error: String(e?.message || e) };
   }
 
-  // C) fundgz（估值，不致命）
+  // C) fundgz（估值）
   try {
-    const r = await fetchText(fundgzUrl, { timeoutMs: 7000, retries: 1 });
+    const r = await fetchText(fundgzUrl, { timeoutMs: 7500, retries: 1 });
     debug.fundgz = { ok: r.ok, status: r.status };
 
     if (r.ok && r.text) {
@@ -237,99 +235,200 @@ app.get("/api/cn/fund/:code", async (req, res) => {
   return res.json({ ...out, debug });
 });
 
-/* =========================
-   新闻关键词计划：/api/news/plan
-   目标：不要用基金全名，而是“宏观+主题+公司/指数/地区”
-========================= */
-app.post("/api/news/plan", (req, res) => {
-  const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
+/* ============================================================
+   新闻系统（A+B+C）
+   A: 按仓位加权生成关键词 + 配额
+   B: 每条新闻 sentiment(利好/利空/中性) + 主题标签
+   C: 自动生成“对我组合的影响摘要”
+============================================================ */
 
-  const joined = positions
-    .map((p) => String(p?.name || "").trim())
-    .filter(Boolean)
+/* ---------- 主题识别：从持仓推主题标签 ---------- */
+function inferThemesFromPositions(positions) {
+  const themes = new Set();
+
+  const text = positions
+    .map((p) => `${p.type || ""} ${p.code || ""} ${p.name || ""}`)
     .join(" ");
 
-  // 宏观固定（少而精，覆盖“会影响组合的大变量”）
-  const macro = [
-    "美联储", "降息", "加息", "CPI", "非农",
-    "美元指数", "美债收益率",
-    "人民币", "央行", "降准", "LPR",
-    "中美关系", "财政政策", "货币政策"
-  ];
+  // 你常见组合：港股科技/科创/全球成长/越南
+  if (/(恒生科技|港股科技|港股通|中概|腾讯|阿里|美团|小米|京东)/i.test(text)) themes.add("港股科技");
+  if (/(科创|科创50|科创板|中芯|寒武纪|信创)/i.test(text)) themes.add("科创/国产科技");
+  if (/(AI|人工智能|半导体|芯片|算力|英伟达|NVIDIA|台积电|TSMC)/i.test(text)) themes.add("科技/AI");
+  if (/(全球|成长|QDII|纳指|QQQ|标普|SPY|AAPL|MSFT|NVDA)/i.test(text)) themes.add("全球成长/美股");
+  if (/(越南|东南亚)/i.test(text)) themes.add("越南/东南亚");
 
-  const themes = new Set();
-  const themeWords = [];
+  if (themes.size === 0) themes.add("综合市场");
+  return Array.from(themes);
+}
 
-  const addTheme = (t, words = []) => {
-    themes.add(t);
-    themeWords.push(...words);
+/* ---------- 主题 -> 关键词库（投研级） ---------- */
+const THEME_KEYWORDS = {
+  "宏观": [
+    "美联储","降息","加息","CPI","非农",
+    "美元指数","美债收益率",
+    "人民币","央行","降准","LPR",
+    "财政政策","货币政策","中美关系"
+  ],
+  "科技/AI": [
+    "AI","半导体","芯片","算力",
+    "英伟达","NVIDIA","台积电","TSMC",
+    "纳指","QQQ"
+  ],
+  "港股科技": [
+    "恒生科技","港股科技","中概股",
+    "腾讯","阿里","美团","小米","京东"
+  ],
+  "科创/国产科技": [
+    "科创板","科创50","国产替代","信创","中芯国际"
+  ],
+  "全球成长/美股": [
+    "美股","标普","SPY","纳指","QQQ",
+    "苹果","AAPL","微软","MSFT"
+  ],
+  "越南/东南亚": [
+    "越南","越南出口","东南亚","制造业PMI","外资流入","汇率"
+  ],
+  "综合市场": ["A股","美股","港股"]
+};
+
+/* ---------- A：按仓位计算主题权重 ---------- */
+function computeThemeWeights(positions, themes) {
+  // 用 amount 或 mv 做权重；没有 mv 就用 amount
+  let total = 0;
+  const raw = {};
+
+  for (const p of positions) {
+    const w = Number(p?.mv || p?.amount || 0);
+    if (!Number.isFinite(w) || w <= 0) continue;
+
+    // 这个持仓属于哪些主题（粗匹配）
+    const n = `${p?.name || ""} ${p?.code || ""}`.toLowerCase();
+
+    let hit = false;
+    for (const t of themes) {
+      if (t === "综合市场") continue;
+
+      const rule =
+        t === "港股科技" ? /(恒生科技|港股|中概|tencent|alibaba|美团|小米|京东)/i :
+        t === "科创/国产科技" ? /(科创|科创50|科创板|信创|国产替代|中芯|寒武纪)/i :
+        t === "科技/AI" ? /(ai|半导体|芯片|算力|nvidia|英伟达|tsmc|台积电)/i :
+        t === "全球成长/美股" ? /(qdii|纳指|qqq|spy|aapl|msft|nvda|标普|美股)/i :
+        t === "越南/东南亚" ? /(越南|东南亚|vietnam)/i :
+        null;
+
+      if (rule && rule.test(n)) {
+        raw[t] = (raw[t] || 0) + w;
+        hit = true;
+      }
+    }
+
+    // 如果没命中任何具体主题，就扔给“综合市场”
+    if (!hit) raw["综合市场"] = (raw["综合市场"] || 0) + w;
+
+    total += w;
+  }
+
+  // 没有任何权重信息（比如你还没刷新价格），默认均分
+  if (total <= 0) {
+    const eq = 1 / themes.length;
+    const w = {};
+    for (const t of themes) w[t] = eq;
+    return w;
+  }
+
+  // 归一化
+  const out = {};
+  let sum = 0;
+  for (const t of themes) {
+    const v = raw[t] || 0;
+    out[t] = v;
+    sum += v;
+  }
+  if (sum <= 0) {
+    const eq = 1 / themes.length;
+    const w = {};
+    for (const t of themes) w[t] = eq;
+    return w;
+  }
+  for (const t of Object.keys(out)) out[t] = out[t] / sum;
+  return out;
+}
+
+/* ---------- A：生成关键词 + 每个关键词权重 ---------- */
+function buildWeightedKeywords(positions) {
+  const themes = inferThemesFromPositions(positions);
+  const themeWeights = computeThemeWeights(positions, themes);
+
+  // 宏观固定，但权重较低（占比 0.25 左右）
+  const macro = THEME_KEYWORDS["宏观"] || [];
+
+  // 主题关键词（按仓位放大权重）
+  const weighted = new Map(); // kw -> weight(float)
+
+  const addKw = (kw, w) => {
+    if (!kw) return;
+    const cur = weighted.get(kw) || 0;
+    weighted.set(kw, cur + w);
   };
 
-  // 更像投研的主题映射
-  const nameText = joined;
+  // 宏观：统一给 0.25 的总权重
+  const macroTotalW = 0.25;
+  const perMacro = macro.length ? (macroTotalW / macro.length) : 0;
+  for (const kw of macro) addKw(kw, perMacro);
 
-  if (/(科技|科创|恒生科技|互联网|AI|半导体|芯片|算力|云计算)/i.test(nameText)) {
-    addTheme("科技/AI", [
-      "AI", "半导体", "芯片", "算力",
-      "英伟达", "NVIDIA", "台积电", "TSMC",
-      "纳指", "QQQ"
-    ]);
+  // 主题：其余 0.75 按仓位分配
+  const themeBudget = 0.75;
+  for (const t of themes) {
+    const w = themeWeights[t] || 0;
+    const kws = THEME_KEYWORDS[t] || THEME_KEYWORDS["综合市场"];
+    const per = kws.length ? (themeBudget * w / kws.length) : 0;
+    for (const kw of kws) addKw(kw, per);
   }
 
-  if (/(港股|恒生|恒生科技)/.test(nameText)) {
-    addTheme("港股科技", [
-      "恒生科技", "港股科技",
-      "腾讯", "阿里", "美团", "小米", "京东"
-    ]);
-  }
-
-  if (/(越南|东南亚)/.test(nameText)) {
-    addTheme("越南/东南亚", [
-      "越南", "越南出口", "东南亚",
-      "制造业PMI", "外资流入", "汇率"
-    ]);
-  }
-
-  if (/(全球|成长|QDII|纳指|标普|美股)/.test(nameText)) {
-    addTheme("全球成长", [
-      "标普", "SPY", "美股", "科技股",
-      "苹果", "AAPL", "微软", "MSFT"
-    ]);
-  }
-
-  if (themes.size === 0) {
-    addTheme("综合市场", ["A股", "美股", "港股"]);
-  }
-
-  // related：只做“短实体词”，不塞基金全名
+  // related：只加入短实体（避免基金全名噪音）
   const related = [];
   for (const p of positions) {
     const n = String(p?.name || "");
     if (/恒生科技/.test(n)) related.push("恒生科技");
     if (/科创50/.test(n)) related.push("科创50");
     if (/越南/.test(n)) related.push("越南");
-    if (/全球成长|全球精选|全球/.test(n)) related.push("全球成长");
+    if (/纳指|QQQ|标普|SPY/.test(n)) related.push("纳指");
   }
+  for (const kw of related) addKw(kw, 0.08); // 轻量加权
 
-  const keywords = Array.from(new Set([...macro, ...themeWords, ...related]))
-    .filter(Boolean)
-    .slice(0, 35);
+  // 输出：keywords + weights
+  const arr = Array.from(weighted.entries())
+    .filter(([k, w]) => k && w > 0)
+    .sort((a, b) => b[1] - a[1]);
+
+  // 控制关键词数量（避免过多导致抓取分散）
+  const MAX = 28;
+  const top = arr.slice(0, MAX);
+
+  const keywords = top.map(([k]) => k);
+  const weightsObj = {};
+  for (const [k, w] of top) weightsObj[k] = Number(w.toFixed(4));
+
+  return { themes, themeWeights, keywords, weights: weightsObj };
+}
+
+/* ---------- /api/news/plan (A) ---------- */
+app.post("/api/news/plan", (req, res) => {
+  const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
+  const plan = buildWeightedKeywords(positions);
 
   res.json({
     ok: true,
-    themes: Array.from(themes),
-    keywords,
-    buckets: {
-      macro,
-      themeWords: Array.from(new Set(themeWords)),
-      related
-    }
+    themes: plan.themes,
+    themeWeights: plan.themeWeights,
+    keywords: plan.keywords,
+    weights: plan.weights,
+    note:
+      "关键词=宏观(固定低权重)+主题(按仓位加权)+短实体(轻权重)，已避免基金全名噪音"
   });
 });
 
-/* =========================
-   RSS 解析：非严格 XML，用正则够用
-========================= */
+/* ---------- RSS 解析（简易） ---------- */
 function parseRssItems(xml) {
   const items = [];
   const blocks = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
@@ -348,7 +447,6 @@ function parseRssItems(xml) {
     let pubDate = stripCdata(pick("pubDate"));
     let desc = stripCdata(pick("description"));
 
-    // desc 去标签
     desc = (desc || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 
     if (title && link) items.push({ title, link, pubDate, description: desc });
@@ -356,62 +454,105 @@ function parseRssItems(xml) {
   return items;
 }
 
-/* =========================
-   新闻抓取：/api/news/rss
-   - 多关键词
-   - 垃圾过滤（申购/限购/公告/八卦…）
-   - 打分排序（更像投研看“重要性”）
-========================= */
+/* ---------- B：新闻过滤 + 打分 + 情绪/影响标签 ---------- */
 const NEWS_BLOCK_WORDS = [
-  "限购", "申购", "募集", "规模", "份额", "分红",
-  "公告", "暂停", "恢复", "净值估算", "估值",
-  "塌房", "八卦", "测评", "榜单", "口水", "吃瓜"
+  "限购","申购","募集","规模","份额","分红",
+  "公告","暂停","恢复","净值估算","估值",
+  "塌房","八卦","测评","榜单","吃瓜"
 ];
 
+const BULLISH_WORDS = [
+  "降息","宽松","超预期利好","利好","上调","回升","反弹","大涨","资金流入","增长","落地","提振","刺激"
+];
+
+const BEARISH_WORDS = [
+  "加息","收紧","不降息","延后降息","超预期偏强","利空","下调","回落","大跌","资金流出","衰退","压力","下滑"
+];
+
+const THEME_MATCHERS = [
+  { theme: "宏观", re: /(美联储|降息|加息|CPI|非农|通胀|美元指数|美债收益率|央行|降准|LPR)/i },
+  { theme: "科技/AI", re: /(AI|人工智能|半导体|芯片|算力|英伟达|NVIDIA|台积电|TSMC|纳指|QQQ)/i },
+  { theme: "港股科技", re: /(恒生科技|港股科技|中概|腾讯|阿里|美团|小米|京东)/i },
+  { theme: "科创/国产科技", re: /(科创|科创50|科创板|信创|国产替代|中芯|寒武纪)/i },
+  { theme: "全球成长/美股", re: /(美股|标普|SPY|纳指|QQQ|AAPL|苹果|MSFT|微软|NVDA)/i },
+  { theme: "越南/东南亚", re: /(越南|东南亚|Vietnam|出口)/i },
+];
+
+function classifyThemes(text) {
+  const hit = new Set();
+  for (const m of THEME_MATCHERS) {
+    if (m.re.test(text)) hit.add(m.theme);
+  }
+  if (hit.size === 0) hit.add("综合市场");
+  return Array.from(hit);
+}
+
+function sentimentOf(text) {
+  const t = (text || "").toLowerCase();
+
+  // 垃圾词：强扣分并倾向中性（避免误导）
+  for (const w of NEWS_BLOCK_WORDS) {
+    if (t.includes(w.toLowerCase())) {
+      return { sentiment: "neutral", impact: "noise" };
+    }
+  }
+
+  let bull = 0, bear = 0;
+
+  for (const w of BULLISH_WORDS) if (t.includes(w.toLowerCase())) bull++;
+  for (const w of BEARISH_WORDS) if (t.includes(w.toLowerCase())) bear++;
+
+  if (bull - bear >= 2) return { sentiment: "bullish", impact: "positive" };
+  if (bear - bull >= 2) return { sentiment: "bearish", impact: "negative" };
+  return { sentiment: "neutral", impact: "neutral" };
+}
+
+// 重要性打分：关键词命中 + 宏观/科技加分 + 垃圾词扣分
 function scoreNewsItem({ title = "", description = "" }, keyword = "") {
   const text = `${title} ${description}`.toLowerCase();
   let score = 0;
 
-  // 命中关键词加分（越贴合你组合主题越重要）
   const kw = (keyword || "").toLowerCase();
   if (kw && text.includes(kw)) score += 3;
 
-  // 宏观重要词加分（你可以继续扩充）
-  const macroBoost = ["美联储", "降息", "加息", "CPI", "非农", "降准", "LPR"];
-  for (const w of macroBoost) {
-    if (text.includes(w.toLowerCase())) score += 2;
-  }
+  const macroBoost = ["美联储","降息","加息","cpi","非农","通胀","降准","lpr"];
+  for (const w of macroBoost) if (text.includes(w.toLowerCase())) score += 2;
 
-  // 科技资产重要词（你持仓主线）
-  const techBoost = ["ai", "半导体", "芯片", "算力", "nvidia", "英伟达", "台积电", "tsmc"];
-  for (const w of techBoost) {
-    if (text.includes(w.toLowerCase())) score += 1;
-  }
+  const techBoost = ["ai","半导体","芯片","算力","nvidia","英伟达","tsmc","台积电","纳指","qqq"];
+  for (const w of techBoost) if (text.includes(w.toLowerCase())) score += 1;
 
-  // 垃圾词强扣分（基本就不想看）
-  for (const w of NEWS_BLOCK_WORDS) {
-    if (text.includes(w.toLowerCase())) score -= 6;
-  }
+  for (const w of NEWS_BLOCK_WORDS) if (text.includes(w.toLowerCase())) score -= 6;
 
   return score;
 }
 
+/* ---------- /api/news/rss (A+B) ----------
+   支持两种用法：
+   1) keywords=...&limit=12&minScore=1   （兼容你现有前端）
+   2) keywords=...&weights=JSON&limit=12 （按权重分配抓取配额）
+---------------------------------------- */
 app.get("/api/news/rss", async (req, res) => {
   const keywordsRaw = String(req.query.keywords || "").trim();
-  const limit = Math.max(1, Math.min(30, Number(req.query.limit || 12)));
+  const limit = clamp(Number(req.query.limit || 12), 1, 30);
   const minScore = Number.isFinite(Number(req.query.minScore))
     ? Number(req.query.minScore)
-    : 1; // 默认只留 score>=1 的
+    : 1;
 
-  if (!keywordsRaw) {
-    return res.status(400).json({ ok: false, error: "keywords required" });
-  }
+  if (!keywordsRaw) return res.status(400).json({ ok: false, error: "keywords required" });
 
   const kws = keywordsRaw
     .split(/[,，\n]/)
     .map((s) => s.trim())
     .filter(Boolean)
-    .slice(0, 10);
+    .slice(0, 12);
+
+  // weights：可选（A 的“按仓位加权抓取配额”）
+  let weights = null;
+  try {
+    if (req.query.weights) weights = JSON.parse(String(req.query.weights));
+  } catch {
+    weights = null;
+  }
 
   const debug = [];
   const all = [];
@@ -425,16 +566,68 @@ app.get("/api/news/rss", async (req, res) => {
     return parseRssItems(r.text);
   }
 
+  // A：给每个 keyword 分配配额（默认均分；如果有 weights 则按权重分配）
+  const quota = {};
+  if (weights && typeof weights === "object") {
+    let sumW = 0;
+    for (const kw of kws) sumW += Number(weights[kw] || 0);
+    if (sumW <= 0) sumW = kws.length;
+
+    let assigned = 0;
+    for (const kw of kws) {
+      const w = Number(weights[kw] || 0);
+      const q = Math.max(1, Math.round((limit * (w > 0 ? w : (1 / kws.length))) / sumW));
+      quota[kw] = q;
+      assigned += q;
+    }
+    // 调整总量到 limit（削减最大者）
+    while (assigned > limit) {
+      let best = kws[0];
+      for (const kw of kws) if (quota[kw] > quota[best]) best = kw;
+      quota[best] = Math.max(1, quota[best] - 1);
+      assigned--;
+    }
+  } else {
+    const q = Math.max(1, Math.floor(limit / kws.length));
+    for (const kw of kws) quota[kw] = q;
+  }
+
   // 并发抓取
   const results = await Promise.all(
     kws.map(async (kw) => {
       const list = await fetchGoogleNewsRss(kw);
-      return list.map((it) => ({
-        ...it,
-        keyword: kw,
-        source: "google_news_rss",
-        score: scoreNewsItem(it, kw)
-      }));
+      // 每个关键词只取 quota 条（先多取后评分排序更稳）
+      const enriched = list.map((it) => {
+        const text = `${it.title || ""} ${it.description || ""}`;
+        const themes = classifyThemes(text);
+        const s = sentimentOf(text);
+        const score = scoreNewsItem(it, kw);
+        return {
+          ...it,
+          keyword: kw,
+          source: "google_news_rss",
+          themes,
+          sentiment: s.sentiment,   // bullish/bearish/neutral
+          impact: s.impact,         // positive/negative/neutral/noise
+          score
+        };
+      });
+
+      // 先过滤低分和噪音，再按 score 排序取 quota
+      const filtered = enriched
+        .filter((x) => x.score >= minScore && x.impact !== "noise")
+        .sort((a, b) => b.score - a.score);
+
+      const pick = filtered.slice(0, quota[kw] || 1);
+      // 如果过滤后不够，兜底补一点 neutral
+      if (pick.length < (quota[kw] || 1)) {
+        const backup = enriched
+          .filter((x) => x.score >= 0)
+          .sort((a, b) => b.score - a.score)
+          .slice(0, quota[kw] || 1);
+        return backup;
+      }
+      return pick;
     })
   );
 
@@ -449,23 +642,126 @@ app.get("/api/news/rss", async (req, res) => {
     uniq.push(it);
   }
 
-  // 过滤：先按 score 过滤，再按 score 排序
-  const filtered = uniq
-    .filter((it) => it.score >= minScore)
-    .sort((a, b) => b.score - a.score);
-
-  // 如果过滤后太少，兜底：放开到 score>=0，保证不至于“空”
-  const finalList =
-    filtered.length >= Math.min(5, limit)
-      ? filtered.slice(0, limit)
-      : uniq.sort((a, b) => b.score - a.score).slice(0, limit);
+  // 全局再按 score 排序
+  const finalList = uniq.sort((a, b) => b.score - a.score).slice(0, limit);
 
   res.json({
     ok: true,
     items: finalList,
     debug,
+    quota,
     note:
-      "已进行过滤与打分排序（默认 minScore=1）。你可以传 ?minScore=2 提高质量。"
+      "已按关键词配额抓取（可选 weights），并做过滤/打分/情绪标签。可用 ?minScore=2 提高相关度。"
+  });
+});
+
+/* ---------- C：组合影响摘要 /api/news/brief ----------
+   输入：positions + newsItems
+   输出：可直接喂给 AI 的“新闻影响摘要”
+---------------------------------------- */
+app.post("/api/news/brief", (req, res) => {
+  const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
+  const items = Array.isArray(req.body?.items) ? req.body.items : [];
+
+  const themes = inferThemesFromPositions(positions);
+  const themeWeights = computeThemeWeights(positions, themes);
+
+  // 聚合：每个主题 bullish/bearish/neutral 计数 + top 新闻
+  const themeAgg = {};
+  for (const t of themes) themeAgg[t] = { bullish: 0, bearish: 0, neutral: 0, top: [] };
+
+  const sorted = items
+    .map((it) => ({
+      ...it,
+      score: Number(it.score || 0),
+      themes: Array.isArray(it.themes) ? it.themes : classifyThemes(`${it.title || ""} ${it.description || ""}`),
+      sentiment: it.sentiment || sentimentOf(`${it.title || ""} ${it.description || ""}`).sentiment,
+      impact: it.impact || sentimentOf(`${it.title || ""} ${it.description || ""}`).impact,
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  for (const it of sorted) {
+    for (const t of it.themes) {
+      if (!themeAgg[t]) themeAgg[t] = { bullish: 0, bearish: 0, neutral: 0, top: [] };
+      if (it.sentiment === "bullish") themeAgg[t].bullish++;
+      else if (it.sentiment === "bearish") themeAgg[t].bearish++;
+      else themeAgg[t].neutral++;
+
+      // top 收集（每主题最多 3 条）
+      if (themeAgg[t].top.length < 3 && it.score >= 1) {
+        themeAgg[t].top.push({ title: it.title, link: it.link, score: it.score, sentiment: it.sentiment });
+      }
+    }
+  }
+
+  // 生成“要点”
+  const topItems = sorted.slice(0, 8);
+
+  const takeaways = [];
+  const macroLike = topItems.filter((x) => (x.themes || []).includes("宏观") || /美联储|非农|CPI|通胀/i.test(x.title || ""));
+  if (macroLike.length) {
+    const b = macroLike.filter((x) => x.sentiment === "bearish").length;
+    const u = macroLike.filter((x) => x.sentiment === "bullish").length;
+    takeaways.push(
+      `宏观：近期消息偏${u > b ? "利好风险资产" : b > u ? "利空成长/科技" : "中性"}（来自美联储/非农/CPI等叙事）。`
+    );
+  }
+
+  // 每个主题一个“风向”
+  const themeOut = [];
+  for (const t of Object.keys(themeAgg)) {
+    const a = themeAgg[t];
+    const w = themeWeights[t] || 0;
+    const bias =
+      a.bullish - a.bearish >= 2 ? "偏利好" :
+      a.bearish - a.bullish >= 2 ? "偏利空" :
+      "偏中性";
+    themeOut.push({
+      theme: t,
+      weight: Number(w.toFixed(3)),
+      bias,
+      bullish: a.bullish,
+      bearish: a.bearish,
+      neutral: a.neutral,
+      top: a.top
+    });
+  }
+
+  // 再给组合一个“总风向”（按主题仓位加权）
+  let score = 0;
+  for (const t of themeOut) {
+    const w = t.weight || 0;
+    if (t.bias === "偏利好") score += 1 * w;
+    if (t.bias === "偏利空") score -= 1 * w;
+  }
+  const portfolioBias =
+    score > 0.15 ? "整体偏利好（顺风）" :
+    score < -0.15 ? "整体偏利空（逆风）" :
+    "整体偏中性（震荡）";
+
+  // 输出一段可直接喂给 AI 的文本（C 的落地）
+  const briefTextLines = [];
+  briefTextLines.push(`【新闻影响摘要】${portfolioBias}`);
+  briefTextLines.push(`持仓主题权重：${themeOut
+    .sort((a, b) => (b.weight || 0) - (a.weight || 0))
+    .map((x) => `${x.theme} ${(x.weight * 100).toFixed(1)}%（${x.bias}）`)
+    .join("；")}`);
+
+  if (takeaways.length) {
+    briefTextLines.push(`要点：`);
+    for (const t of takeaways.slice(0, 4)) briefTextLines.push(`- ${t}`);
+  }
+
+  briefTextLines.push(`重点新闻（按重要性）：`);
+  for (const it of topItems.slice(0, 6)) {
+    briefTextLines.push(`- [${it.sentiment || "neutral"}|${(it.themes || []).join("/")}] ${it.title}`);
+  }
+
+  res.json({
+    ok: true,
+    portfolioBias,
+    themeOut,
+    briefText: briefTextLines.join("\n")
   });
 });
 
