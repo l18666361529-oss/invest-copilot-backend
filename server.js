@@ -8,30 +8,36 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 3000;
 
 app.get("/", (_req, res) => res.send("Invest Copilot Backend is running. Try /health"));
-
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+/** 小工具：抓文本 */
+async function fetchText(url) {
+  const r = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      "Referer": "https://fund.eastmoney.com/"
+    }
+  });
+  const text = await r.text();
+  return { ok: r.ok, status: r.status, text };
+}
+
 /**
- * 国内基金（优先 fundgz；失败则回退东财接口）
+ * 国内基金：优先 fundgz（估值）；失败后用 东财历史净值接口（稳定）抓“最新净值”
  * GET /api/cn/fund/025167
  */
 app.get("/api/cn/fund/:code", async (req, res) => {
   const code = String(req.params.code || "").trim();
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: "fund code must be 6 digits" });
 
-  // 1) fundgz（估值/净值，常用）
+  // 1) fundgz（估值/净值）
   try {
     const url = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
-    const r = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Referer": "https://fund.eastmoney.com/"
-      }
-    });
+    const { ok, status, text } = await fetchText(url);
+    if (!ok) throw new Error(`fundgz status ${status}`);
 
-    const text = await r.text();
     const m = text.match(/jsonpgz\((\{.*\})\);?/);
-    if (!m) throw new Error("fundgz upstream format changed or blocked");
+    if (!m) throw new Error("fundgz format changed or blocked");
 
     const obj = JSON.parse(m[1]);
     return res.json({
@@ -45,40 +51,43 @@ app.get("/api/cn/fund/:code", async (req, res) => {
       time: obj.gztime || null
     });
   } catch (e1) {
-    // 2) 备用：东财基金档案接口（稳定，但字段不同；这里给一个可用的“兜底”结构）
+    // 2) 兜底：东财历史净值（HTML表格，稳定）
     try {
-      // 注意：不同基金/接口字段可能略有差异，这里目标是“能返回价格类信息”
-      // 这个接口返回的是文本/JSON（部分情况下需要再 parse）
-      const url2 = `https://fund.eastmoney.com/pingzhongdata/${code}.js?v=${Date.now()}`;
-      const r2 = await fetch(url2, {
-        headers: { "User-Agent": "Mozilla/5.0" }
-      });
-      const jsText = await r2.text();
+      // page=1&per=1 -> 拿最新一条
+      const url2 = `https://fund.eastmoney.com/f10/F10DataApi.aspx?type=lsjz&code=${code}&page=1&per=1`;
+      const { ok, status, text } = await fetchText(url2);
+      if (!ok) throw new Error(`eastmoney lsjz status ${status}`);
 
-      // 从 JS 文本里抓基金名称和最新净值（净值通常在 Data_netWorthTrend / 相关变量里）
-      // 为了稳妥，这里只抓名字（fS_name）+ 近似最新净值（从 Data_netWorthTrend 最后一项）
-      const nameMatch = jsText.match(/fS_name\\s*=\\s*\"([^\"]+)\"/);
-      const trendMatch = jsText.match(/Data_netWorthTrend\\s*=\\s*(\\[.*?\\]);/s);
+      // 返回形如：var apidata={ content:"<table>...</table>", ...}
+      const contentMatch = text.match(/content:\"([\s\S]*?)\",/);
+      if (!contentMatch) throw new Error("eastmoney lsjz parse failed: no content");
 
-      let name = nameMatch ? nameMatch[1] : null;
-      let nav = null;
-      if (trendMatch) {
-        const arr = JSON.parse(trendMatch[1]);
-        const last = arr[arr.length - 1];
-        // last: {x:时间戳, y:净值, equityReturn, unitMoney}
-        nav = last?.y ?? null;
-      }
+      // content 里是 HTML（带转义），我们抓 <td>日期</td><td>单位净值</td>
+      const html = contentMatch[1]
+        .replace(/\\"/g, '"')
+        .replace(/\\n/g, "")
+        .replace(/\\r/g, "");
+
+      // 取第一行数据的 日期 和 净值（单位净值在第二列）
+      const rowMatch = html.match(/<tr>([\s\S]*?)<\/tr>/);
+      if (!rowMatch) throw new Error("eastmoney lsjz parse failed: no row");
+
+      const tds = rowMatch[1].match(/<td[^>]*>(.*?)<\/td>/g) || [];
+      const clean = (s) => s.replace(/<[^>]+>/g, "").trim();
+
+      const date = tds[0] ? clean(tds[0]) : null;
+      const nav = tds[1] ? Number(clean(tds[1])) : null;
 
       return res.json({
-        source: "eastmoney_pingzhongdata_fallback",
+        source: "eastmoney_lsjz_fallback",
         code,
-        name,
-        navDate: null,
+        name: null, // 这个接口不直接给名称（可后续补一个名称接口）
+        navDate: date,
         nav,
         estNav: null,
         estPct: null,
         time: null,
-        note: "fundgz failed; returned fallback net worth"
+        note: "fundgz failed; returned latest nav from eastmoney lsjz"
       });
     } catch (e2) {
       return res.status(502).json({
@@ -91,29 +100,53 @@ app.get("/api/cn/fund/:code", async (req, res) => {
 });
 
 /**
- * 国外行情：Yahoo Finance
+ * 国外行情：用 Stooq（免费无Key，CSV）
  * GET /api/gl/quote?symbols=SPY,QQQ,AAPL
+ *
+ * Stooq 规则：美股/ETF 用 小写 + .us，例如 aapl.us / spy.us
  */
 app.get("/api/gl/quote", async (req, res) => {
   try {
     const symbols = String(req.query.symbols || "").trim();
     if (!symbols) return res.status(400).json({ error: "symbols required" });
 
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}`;
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-    if (!r.ok) return res.status(502).json({ error: "yahoo upstream error", status: r.status });
+    const list = symbols.split(",").map(s => s.trim()).filter(Boolean);
+    const quotes = [];
 
-    const data = await r.json();
-    const quotes = (data?.quoteResponse?.result || []).map(q => ({
-      symbol: q.symbol,
-      name: q.shortName || q.longName || null,
-      price: typeof q.regularMarketPrice === "number" ? q.regularMarketPrice : null,
-      changePct: typeof q.regularMarketChangePercent === "number" ? q.regularMarketChangePercent : null,
-      time: q.regularMarketTime ? new Date(q.regularMarketTime * 1000).toISOString() : null,
-      currency: q.currency || null
-    }));
+    for (const sym of list) {
+      const stooqSym = `${sym.toLowerCase()}.us`;
+      const url = `https://stooq.com/q/l/?s=${encodeURIComponent(stooqSym)}&f=sd2t2ohlcv&h&e=csv`;
+      const { ok, status, text } = await fetchText(url);
+      if (!ok) {
+        quotes.push({ symbol: sym, error: `stooq status ${status}` });
+        continue;
+      }
 
-    return res.json({ source: "yahoo", quotes });
+      // CSV:
+      // Symbol,Date,Time,Open,High,Low,Close,Volume
+      // AAPL.US,2026-01-09,22:00:02,.......
+      const lines = text.trim().split("\n");
+      if (lines.length < 2) {
+        quotes.push({ symbol: sym, error: "stooq empty" });
+        continue;
+      }
+      const cols = lines[1].split(",");
+      const close = Number(cols[6]);
+      const date = cols[1];
+      const time = cols[2];
+
+      quotes.push({
+        symbol: sym,
+        name: null,
+        price: Number.isFinite(close) ? close : null,
+        changePct: null,
+        time: date && time ? `${date}T${time}` : null,
+        currency: "USD",
+        source: "stooq"
+      });
+    }
+
+    return res.json({ source: "stooq", quotes });
   } catch (e) {
     return res.status(500).json({ error: String(e?.message || e) });
   }
