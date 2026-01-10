@@ -22,7 +22,7 @@ app.get("/api/debug/time", (_req, res) => {
 });
 
 /* =========================
-   工具函数
+   工具函数：fetch + 超时 + 重试
 ========================= */
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -72,6 +72,9 @@ function safeNum(x) {
   return Number.isFinite(n) ? n : null;
 }
 
+/* =========================
+   pingzhongdata 解析：最新净值 / 名称
+========================= */
 function pickLatestNavFromPingzhongdata(jsText) {
   const m = jsText.match(/var\s+Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
   if (!m) return null;
@@ -105,7 +108,8 @@ function pickNameFromPingzhongdata(jsText) {
 }
 
 /* =========================
-   国内基金（多源容错：lsjz + pingzhongdata + fundgz）
+   国内基金：/api/cn/fund/:code
+   多源容错：lsjz(官方) + pingzhongdata(官方备用) + fundgz(估值)
 ========================= */
 app.get("/api/cn/fund/:code", async (req, res) => {
   const code = String(req.params.code || "").trim();
@@ -136,7 +140,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
 
   const debug = { lsjz: null, pingzhongdata: null, fundgz: null };
 
-  // A) lsjz
+  // A) lsjz（官方净值）
   try {
     const r = await fetchText(lsjzUrl, { timeoutMs: 9000, retries: 1 });
     debug.lsjz = { ok: r.ok, status: r.status };
@@ -165,7 +169,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
     debug.lsjz = { ok: false, error: String(e?.message || e) };
   }
 
-  // B) pingzhongdata 备用
+  // B) pingzhongdata（官方备用）
   try {
     const r = await fetchText(pzdUrl, { timeoutMs: 9000, retries: 1 });
     debug.pingzhongdata = { ok: r.ok, status: r.status };
@@ -186,7 +190,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
     debug.pingzhongdata = { ok: false, error: String(e?.message || e) };
   }
 
-  // C) fundgz 估值（失败不致命）
+  // C) fundgz（估值，不致命）
   try {
     const r = await fetchText(fundgzUrl, { timeoutMs: 7000, retries: 1 });
     debug.fundgz = { ok: r.ok, status: r.status };
@@ -200,6 +204,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
         out.estPct = safeNum(gz.gszzl);
         out.time = gz.gztime || null;
 
+        // 只有在没有官方净值时，才用 fundgz 的 dwjz/jzrq 兜底
         if (out.nav == null && out.navDate == null) {
           const navDate = gz.jzrq || null;
           const nav = safeNum(gz.dwjz);
@@ -234,181 +239,238 @@ app.get("/api/cn/fund/:code", async (req, res) => {
 
 /* =========================
    新闻关键词计划：/api/news/plan
-   输入：{ positions: [{type,code,name,amount}] }
-   输出：{ ok, themes, keywords, buckets }
+   目标：不要用基金全名，而是“宏观+主题+公司/指数/地区”
 ========================= */
 app.post("/api/news/plan", (req, res) => {
   const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
 
-  const names = positions
+  const joined = positions
     .map((p) => String(p?.name || "").trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .join(" ");
 
-  // A：宏观固定
+  // 宏观固定（少而精，覆盖“会影响组合的大变量”）
   const macro = [
-    "美联储", "降息", "加息", "通胀", "CPI", "非农",
-    "人民币", "汇率", "中美关系", "财政政策", "货币政策",
-    "央行", "降准", "LPR"
+    "美联储", "降息", "加息", "CPI", "非农",
+    "美元指数", "美债收益率",
+    "人民币", "央行", "降准", "LPR",
+    "中美关系", "财政政策", "货币政策"
   ];
 
-  // B：行业主题（从名称做简单规则匹配）
   const themes = new Set();
-  const addTheme = (t) => themes.add(t);
+  const themeWords = [];
 
-  for (const n of names) {
-    if (/科技|科创|恒生科技|互联网|AI|半导体|芯片/i.test(n)) addTheme("科技");
-    if (/医药|医疗|创新药|生物|疫苗/i.test(n)) addTheme("医药");
-    if (/新能源|光伏|锂电|电池|储能|风电/i.test(n)) addTheme("新能源");
-    if (/消费|白酒|食品|家电/i.test(n)) addTheme("消费");
-    if (/银行|券商|保险|金融/i.test(n)) addTheme("金融");
-    if (/军工|国防/i.test(n)) addTheme("军工");
-    if (/港股|恒生/i.test(n)) addTheme("港股");
-    if (/越南/i.test(n)) addTheme("越南");
-    if (/黄金|贵金属/i.test(n)) addTheme("黄金");
-    if (/原油|油气|能源/i.test(n)) addTheme("能源");
-  }
-
-  if (themes.size === 0) addTheme("综合市场");
-
-  // C：标的相关（名称拆词，避免太长）
-  const related = [];
-  for (const n of names) {
-    const short = n
-      .replace(/ETF联接|联接C|联接A|联接|指数|发起|混合|人民币|QDII|基金|C类|A类/g, "")
-      .trim();
-    if (short && short.length <= 12) related.push(short);
-    if (short && short.length > 12) related.push(short.slice(0, 12));
-  }
-
-  // 关键词池：宏观 + 主题扩展 + 标的
-  const themeMap = {
-    "科技": ["AI", "半导体", "芯片", "算力", "英伟达", "互联网"],
-    "医药": ["创新药", "医保", "医改", "药品集采"],
-    "新能源": ["光伏", "锂电", "储能", "新能源车"],
-    "金融": ["银行", "券商", "利率"],
-    "消费": ["消费", "白酒", "家电"],
-    "港股": ["港股", "恒生", "恒生科技"],
-    "越南": ["越南", "东南亚", "出口"],
-    "能源": ["原油", "油气", "OPEC"],
-    "黄金": ["黄金", "美债收益率"],
-    "综合市场": ["A股", "美股", "纳指", "标普"]
+  const addTheme = (t, words = []) => {
+    themes.add(t);
+    themeWords.push(...words);
   };
 
-  const themeWords = [];
-  for (const t of themes) themeWords.push(...(themeMap[t] || []));
+  // 更像投研的主题映射
+  const nameText = joined;
+
+  if (/(科技|科创|恒生科技|互联网|AI|半导体|芯片|算力|云计算)/i.test(nameText)) {
+    addTheme("科技/AI", [
+      "AI", "半导体", "芯片", "算力",
+      "英伟达", "NVIDIA", "台积电", "TSMC",
+      "纳指", "QQQ"
+    ]);
+  }
+
+  if (/(港股|恒生|恒生科技)/.test(nameText)) {
+    addTheme("港股科技", [
+      "恒生科技", "港股科技",
+      "腾讯", "阿里", "美团", "小米", "京东"
+    ]);
+  }
+
+  if (/(越南|东南亚)/.test(nameText)) {
+    addTheme("越南/东南亚", [
+      "越南", "越南出口", "东南亚",
+      "制造业PMI", "外资流入", "汇率"
+    ]);
+  }
+
+  if (/(全球|成长|QDII|纳指|标普|美股)/.test(nameText)) {
+    addTheme("全球成长", [
+      "标普", "SPY", "美股", "科技股",
+      "苹果", "AAPL", "微软", "MSFT"
+    ]);
+  }
+
+  if (themes.size === 0) {
+    addTheme("综合市场", ["A股", "美股", "港股"]);
+  }
+
+  // related：只做“短实体词”，不塞基金全名
+  const related = [];
+  for (const p of positions) {
+    const n = String(p?.name || "");
+    if (/恒生科技/.test(n)) related.push("恒生科技");
+    if (/科创50/.test(n)) related.push("科创50");
+    if (/越南/.test(n)) related.push("越南");
+    if (/全球成长|全球精选|全球/.test(n)) related.push("全球成长");
+  }
 
   const keywords = Array.from(new Set([...macro, ...themeWords, ...related]))
     .filter(Boolean)
-    .slice(0, 40);
+    .slice(0, 35);
 
   res.json({
     ok: true,
     themes: Array.from(themes),
     keywords,
-    buckets: { macro, themeWords, related }
+    buckets: {
+      macro,
+      themeWords: Array.from(new Set(themeWords)),
+      related
+    }
   });
 });
 
 /* =========================
-   新闻抓取：/api/news/rss
-   查询：?keywords=xxx,yyy&limit=12
-   输出：{ ok, items: [{title,link,pubDate,description,keyword}] }
-   多 RSS 源兜底：Google News RSS + FT(可选) + Reuters(可选)
+   RSS 解析：非严格 XML，用正则够用
 ========================= */
 function parseRssItems(xml) {
-  // 非严格 XML 解析：用正则抓 item（对 RSS 足够）
   const items = [];
   const blocks = xml.match(/<item[\s\S]*?<\/item>/gi) || [];
+
+  const stripCdata = (s) =>
+    (s || "").replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "");
+
   for (const b of blocks) {
     const pick = (tag) => {
       const m = b.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
       return m ? m[1].trim() : "";
     };
 
-    let title = pick("title");
-    let link = pick("link");
-    let pubDate = pick("pubDate");
-    let desc = pick("description");
+    let title = stripCdata(pick("title"));
+    let link = stripCdata(pick("link"));
+    let pubDate = stripCdata(pick("pubDate"));
+    let desc = stripCdata(pick("description"));
 
-    // 去掉 CDATA 包裹
-    const stripCdata = (s) => s.replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "");
-    title = stripCdata(title);
-    link = stripCdata(link);
-    desc = stripCdata(desc);
+    // desc 去标签
+    desc = (desc || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 
-    // 简单去 HTML
-    desc = desc.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-
-    if (title && link) {
-      items.push({ title, link, pubDate, description: desc });
-    }
+    if (title && link) items.push({ title, link, pubDate, description: desc });
   }
   return items;
+}
+
+/* =========================
+   新闻抓取：/api/news/rss
+   - 多关键词
+   - 垃圾过滤（申购/限购/公告/八卦…）
+   - 打分排序（更像投研看“重要性”）
+========================= */
+const NEWS_BLOCK_WORDS = [
+  "限购", "申购", "募集", "规模", "份额", "分红",
+  "公告", "暂停", "恢复", "净值估算", "估值",
+  "塌房", "八卦", "测评", "榜单", "口水", "吃瓜"
+];
+
+function scoreNewsItem({ title = "", description = "" }, keyword = "") {
+  const text = `${title} ${description}`.toLowerCase();
+  let score = 0;
+
+  // 命中关键词加分（越贴合你组合主题越重要）
+  const kw = (keyword || "").toLowerCase();
+  if (kw && text.includes(kw)) score += 3;
+
+  // 宏观重要词加分（你可以继续扩充）
+  const macroBoost = ["美联储", "降息", "加息", "CPI", "非农", "降准", "LPR"];
+  for (const w of macroBoost) {
+    if (text.includes(w.toLowerCase())) score += 2;
+  }
+
+  // 科技资产重要词（你持仓主线）
+  const techBoost = ["ai", "半导体", "芯片", "算力", "nvidia", "英伟达", "台积电", "tsmc"];
+  for (const w of techBoost) {
+    if (text.includes(w.toLowerCase())) score += 1;
+  }
+
+  // 垃圾词强扣分（基本就不想看）
+  for (const w of NEWS_BLOCK_WORDS) {
+    if (text.includes(w.toLowerCase())) score -= 6;
+  }
+
+  return score;
 }
 
 app.get("/api/news/rss", async (req, res) => {
   const keywordsRaw = String(req.query.keywords || "").trim();
   const limit = Math.max(1, Math.min(30, Number(req.query.limit || 12)));
+  const minScore = Number.isFinite(Number(req.query.minScore))
+    ? Number(req.query.minScore)
+    : 1; // 默认只留 score>=1 的
 
   if (!keywordsRaw) {
     return res.status(400).json({ ok: false, error: "keywords required" });
   }
 
-  // 关键词拆分：逗号/中文逗号/空格
   const kws = keywordsRaw
     .split(/[,，\n]/)
     .map((s) => s.trim())
     .filter(Boolean)
-    .slice(0, 10); // 最多取 10 个关键词
+    .slice(0, 10);
 
-  const items = [];
   const debug = [];
+  const all = [];
 
-  // Google News RSS：覆盖面最广、最稳（不需要 key）
-  // 例：https://news.google.com/rss/search?q=AI&hl=zh-CN&gl=CN&ceid=CN:zh-Hans
   async function fetchGoogleNewsRss(keyword) {
     const q = encodeURIComponent(keyword);
     const url = `https://news.google.com/rss/search?q=${q}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans`;
     const r = await fetchText(url, { timeoutMs: 9000, retries: 1 });
     debug.push({ source: "google_news_rss", keyword, ok: r.ok, status: r.status });
     if (!r.ok) return [];
-    return parseRssItems(r.text).slice(0, Math.ceil(limit / kws.length) + 2);
+    return parseRssItems(r.text);
   }
 
   // 并发抓取
-  const results = await Promise.all(kws.map(async (kw) => {
-    const list = await fetchGoogleNewsRss(kw);
-    return list.map(it => ({ ...it, keyword: kw, source: "google_news_rss" }));
-  }));
+  const results = await Promise.all(
+    kws.map(async (kw) => {
+      const list = await fetchGoogleNewsRss(kw);
+      return list.map((it) => ({
+        ...it,
+        keyword: kw,
+        source: "google_news_rss",
+        score: scoreNewsItem(it, kw)
+      }));
+    })
+  );
 
-  for (const arr of results) items.push(...arr);
+  for (const arr of results) all.push(...arr);
 
-  // 去重（按 link）
+  // 去重（link）
   const seen = new Set();
   const uniq = [];
-  for (const it of items) {
+  for (const it of all) {
     if (!it.link || seen.has(it.link)) continue;
     seen.add(it.link);
     uniq.push(it);
-    if (uniq.length >= limit) break;
   }
 
-  if (!uniq.length) {
-    return res.json({
-      ok: true,
-      items: [],
-      note: "no news found (try broader keywords like AI/美联储/港股科技)",
-      debug
-    });
-  }
+  // 过滤：先按 score 过滤，再按 score 排序
+  const filtered = uniq
+    .filter((it) => it.score >= minScore)
+    .sort((a, b) => b.score - a.score);
 
-  res.json({ ok: true, items: uniq.slice(0, limit), debug });
+  // 如果过滤后太少，兜底：放开到 score>=0，保证不至于“空”
+  const finalList =
+    filtered.length >= Math.min(5, limit)
+      ? filtered.slice(0, limit)
+      : uniq.sort((a, b) => b.score - a.score).slice(0, limit);
+
+  res.json({
+    ok: true,
+    items: finalList,
+    debug,
+    note:
+      "已进行过滤与打分排序（默认 minScore=1）。你可以传 ?minScore=2 提高质量。"
+  });
 });
 
 /* =========================
-   你的 AI / 海外行情 路由如果已有，继续往下接
-   （这里先不覆盖你已有的其它代码）
+   启动
 ========================= */
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("server listening on", PORT));
