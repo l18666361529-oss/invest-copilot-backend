@@ -370,7 +370,38 @@ function parseCsvLines(csv) {
 
 async function fetchStooqHistory(symbol, count = 160) {
   const s = ensureStooqSymbol(symbol);
-  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`;
+
+  const urls = [
+    `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`,
+    `https://stooq.pl/q/d/l/?s=${encodeURIComponent(s)}&i=d`, // 备用域名
+  ];
+
+  let lastDbg = null;
+
+  for (const url of urls) {
+    const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
+    const text = r.text || "";
+    const head = text.slice(0, 200);
+    const textLen = text.length;
+
+    // 如果被拦，一般会返回 HTML / 限流提示
+    if (/^\s*</.test(text) || /<html/i.test(text) || /Too Many Requests/i.test(text)) {
+      lastDbg = { url, status: r.status, textLen, head, kind: "non-csv(html/ratelimit)" };
+      continue;
+    }
+
+    const rows = parseCsvLines(text);
+    if (!rows.length) {
+      // 常见：只返回表头/空内容
+      lastDbg = { url, status: r.status, textLen, head, kind: "empty-csv" };
+      continue;
+    }
+
+    return { ok: true, series: rows.slice(-count), stooqSymbol: s, usedUrl: url };
+  }
+
+  return { ok: false, reason: "empty csv", debug: lastDbg };
+}
 
   const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
   if (!r.ok) return { ok: false, reason: `stooq status=${r.status}` };
@@ -517,7 +548,15 @@ app.get("/api/tech/stooq/:symbol", async (req, res) => {
   if (!symbol) return res.status(400).json({ ok: false, error: "symbol required" });
 
   const hist = await fetchStooqHistory(symbol, 200);
-  if (!hist.ok) return res.json({ ok: false, symbol, reason: hist.reason || "history fetch failed", count: 0 });
+  if (!hist.ok) {
+  return res.json({
+    ok: false,
+    symbol,
+    reason: hist.reason || "history fetch failed",
+    count: 0,
+    debug: hist.debug || null,
+  });
+}
 
   const ind = calcIndicatorsFromSeries(hist.series);
   if (ind.count < 60) return res.json({ ok: false, symbol, reason: "insufficient history", count: ind.count });
