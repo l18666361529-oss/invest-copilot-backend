@@ -40,10 +40,23 @@ async function fetchWithTimeout(
 ) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+
+  // 一些站点（东财/聚合）对 UA/Referer 更敏感，统一补上
+  const h = {
+    "User-Agent":
+      headers["User-Agent"] ||
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept":
+      headers["Accept"] || "text/html,application/json,application/xml;q=0.9,*/*;q=0.8",
+    ...headers
+  };
+
   try {
-    const resp = await fetch(url, { method, headers, body, signal: ctrl.signal });
+    const resp = await fetch(url, { method, headers: h, body, signal: ctrl.signal });
     const text = await resp.text();
     return { ok: resp.ok, status: resp.status, text, headers: resp.headers };
+  } catch (e) {
+    return { ok: false, status: 0, text: "", error: String(e) };
   } finally {
     clearTimeout(t);
   }
@@ -59,281 +72,289 @@ function nowInfo() {
   };
 }
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/health", (_req, res) => res.json({ ok: true, ...nowInfo() }));
 
+/* =========================
+   时间 / 时区调试
+========================= */
 app.get("/api/debug/time", (_req, res) => {
-  res.json({ ok: true, ...nowInfo() });
+  res.json({ ok: true, ...nowInfo(), envTZ: process.env.TZ || null });
 });
 
 /* =========================
-   国内基金（双源：fundgz + 东财lsjz）
+   国内基金：实时净值（双源：fundgz + 东财lsjz官方最新）
 ========================= */
-app.get("/api/cn/fund/:code", async (req, res) => {
-  const code = String(req.params.code || "").trim();
-  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: "fund code must be 6 digits" });
-
+async function fetchFundGZ(code) {
   const fundgzUrl = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
-  const lsjzUrl =
+  const r = await fetchWithTimeout(fundgzUrl, { timeoutMs: 15000 });
+  if (!r.ok) return { ok: false, reason: "fundgz fetch failed", status: r.status };
+
+  const m = r.text.match(/jsonpgz\((\{.*\})\);?/);
+  if (!m) return { ok: false, reason: "fundgz format error", status: r.status };
+
+  try {
+    const gz = JSON.parse(m[1]);
+    return { ok: true, data: gz };
+  } catch {
+    return { ok: false, reason: "fundgz json parse error", status: r.status };
+  }
+}
+
+async function fetchEastmoneyLSJZLatest(code) {
+  const url =
     `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}` +
     `&pageIndex=1&pageSize=1&callback=cb&_=${Date.now()}`;
 
+  const r = await fetchWithTimeout(url, {
+    timeoutMs: 15000,
+    headers: {
+      Referer: "https://fund.eastmoney.com/"
+    }
+  });
+  if (!r.ok) return { ok: false, reason: "eastmoney lsjz fetch failed", status: r.status };
+
+  const mm = r.text.match(/cb\((\{.*\})\)/);
+  if (!mm) return { ok: false, reason: "eastmoney lsjz format error", status: r.status };
+
   try {
-    // 1) fundgz（包含估值）
-    const gzResp = await fetchWithTimeout(fundgzUrl, { timeoutMs: 15000 });
-    if (!gzResp.ok) {
-      return res.status(502).json({ error: "cn fund upstream error", detail: "fundgz fetch failed" });
-    }
-    const m = gzResp.text.match(/jsonpgz\((\{.*\})\);?/);
-    if (!m) return res.status(502).json({ error: "fundgz format error" });
-    const gz = JSON.parse(m[1]);
+    const j = JSON.parse(mm[1]);
+    const row = j?.Data?.LSJZList?.[0];
+    if (!row) return { ok: false, reason: "eastmoney lsjz empty", status: r.status };
 
-    let navDate = gz.jzrq || null;
-    let nav = safeNum(gz.dwjz);
-    const estNav = safeNum(gz.gsz);
-    const estPct = safeNum(gz.gszzl);
-    const time = gz.gztime || null;
-    const name = gz.name || null;
-
-    let navSource = "fundgz";
-    let note = null;
-
-    // 2) 东财 lsjz（官方最新净值）
-    const ls = await fetchWithTimeout(lsjzUrl, { timeoutMs: 15000 });
-    if (ls.ok) {
-      const mm = ls.text.match(/cb\((\{.*\})\)/);
-      if (mm) {
-        try {
-          const j = JSON.parse(mm[1]);
-          const row = j?.Data?.LSJZList?.[0];
-          if (row) {
-            const offDate = row.FSRQ || null;
-            const offNav = safeNum(row.DWJZ);
-            if (offDate && typeof offNav === "number") {
-              navDate = offDate;
-              nav = offNav;
-              navSource = "eastmoney_lsjz";
-              note = "official nav updated from eastmoney";
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }
-    }
-
-    return res.json({
-      source: "cn_fund_dual",
-      code,
-      name,
-      navDate,
-      nav,
-      estNav,
-      estPct,
-      time,
-      navSource,
-      note
-    });
-  } catch (e) {
-    return res.status(502).json({ error: "cn fund upstream error", detail: String(e) });
+    const offDate = row.FSRQ || null;
+    const offNav = safeNum(row.DWJZ);
+    return {
+      ok: typeof offNav === "number" && !!offDate,
+      data: { navDate: offDate, nav: offNav }
+    };
+  } catch {
+    return { ok: false, reason: "eastmoney lsjz json parse error", status: r.status };
   }
+}
+
+app.get("/api/cn/fund/:code", async (req, res) => {
+  const code = String(req.params.code || "").trim();
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ ok: false, error: "fund code must be 6 digits" });
+
+  // 1) fundgz（带估值）
+  const gz = await fetchFundGZ(code);
+
+  // 2) 东财官方最新净值（用于“对账口径”）
+  const off = await fetchEastmoneyLSJZLatest(code);
+
+  // 允许 fundgz 挂了但东财还在（或者反过来），不要整个接口报错
+  let name = null;
+  let navDate = null;
+  let nav = null;
+  let estNav = null;
+  let estPct = null;
+  let time = null;
+  let navSource = null;
+  let note = [];
+
+  if (gz.ok) {
+    const d = gz.data;
+    name = d.name || null;
+    navDate = d.jzrq || null;
+    nav = safeNum(d.dwjz);
+    estNav = safeNum(d.gsz);
+    estPct = safeNum(d.gszzl);
+    time = d.gztime || null;
+    navSource = "fundgz";
+  } else {
+    note.push(gz.reason || "fundgz failed");
+  }
+
+  if (off.ok && off.data) {
+    // 有官方就覆盖 nav/navDate（你要的：国内基金尽量显示最新官方净值）
+    navDate = off.data.navDate;
+    nav = off.data.nav;
+    navSource = "eastmoney_lsjz";
+    note.push("official nav updated from eastmoney");
+  } else {
+    note.push(off.reason || "eastmoney failed");
+  }
+
+  // 如果 nav 仍然没有，但 estNav 有，则兜底显示估值
+  const price = (typeof nav === "number" && nav > 0) ? nav : ((typeof estNav === "number" && estNav > 0) ? estNav : null);
+
+  res.json({
+    ok: true,
+    source: "cn_fund_dual",
+    code,
+    name,
+    navDate,
+    nav,
+    estNav,
+    estPct,
+    time,
+    navSource,
+    price,
+    note: note.filter(Boolean).join(" | ")
+  });
 });
 
 /* =========================
-   海外行情（stooq 兜底）
+   国内基金：历史净值序列（用于技术指标，解决 count=0）
+   - 用东财 lsjz 多条历史净值
 ========================= */
+async function fetchEastmoneyLSJZHistory(code, days = 120) {
+  const pageSize = Math.min(200, Math.max(30, Number(days) || 120));
+  const url =
+    `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}` +
+    `&pageIndex=1&pageSize=${pageSize}&callback=cb&_=${Date.now()}`;
+
+  const r = await fetchWithTimeout(url, {
+    timeoutMs: 18000,
+    headers: { Referer: "https://fund.eastmoney.com/" }
+  });
+  if (!r.ok) return { ok: false, reason: "eastmoney history fetch failed", status: r.status };
+
+  const mm = r.text.match(/cb\((\{.*\})\)/);
+  if (!mm) return { ok: false, reason: "eastmoney history format error", status: r.status };
+
+  try {
+    const j = JSON.parse(mm[1]);
+    const list = j?.Data?.LSJZList || [];
+    if (!Array.isArray(list) || list.length === 0) return { ok: false, reason: "eastmoney history empty" };
+
+    // list 通常是倒序（新->旧），我们转成 旧->新
+    const series = list
+      .map(row => ({
+        date: row.FSRQ || null,
+        value: safeNum(row.DWJZ)
+      }))
+      .filter(x => x.date && typeof x.value === "number")
+      .reverse();
+
+    return { ok: series.length > 0, data: series, count: series.length };
+  } catch {
+    return { ok: false, reason: "eastmoney history json parse error", status: r.status };
+  }
+}
+
+app.get("/api/cn/fund/history/:code", async (req, res) => {
+  const code = String(req.params.code || "").trim();
+  const days = Number(req.query.days || 120);
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ ok: false, error: "fund code must be 6 digits" });
+
+  const h = await fetchEastmoneyLSJZHistory(code, days);
+  if (!h.ok) return res.status(502).json({ ok: false, error: "history failed", detail: h.reason || "", count: h.count || 0 });
+  res.json({ ok: true, source: "eastmoney_lsjz", code, count: h.count, series: h.data });
+});
+
+/* =========================
+   海外行情：stooq（修复 .us 问题）
+========================= */
+function normalizeStooqSymbol(sym) {
+  const s = String(sym || "").trim().toLowerCase();
+  if (!s) return "";
+  // 如果用户输入了 AAPL / QQQ 等，stooq 日线通常需要 .us
+  if (s.includes(".")) return s;
+  return `${s}.us`;
+}
+
+function parseStooqCsv(csvText) {
+  const lines = String(csvText || "").trim().split(/\r?\n/);
+  if (lines.length < 2) return { ok: false, reason: "csv empty", count: 0 };
+  const header = lines[0].split(",");
+  // 可能是：Date,Open,High,Low,Close,Volume
+  const idxDate = header.findIndex(x => x.toLowerCase() === "date");
+  const idxClose = header.findIndex(x => x.toLowerCase() === "close");
+  if (idxDate < 0 || idxClose < 0) return { ok: false, reason: "csv header invalid", count: 0 };
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const p = lines[i].split(",");
+    const d = p[idxDate];
+    const c = safeNum(p[idxClose]);
+    if (!d || typeof c !== "number") continue;
+    rows.push({ date: d, close: c });
+  }
+  // stooq 通常是新->旧，转旧->新
+  rows.reverse();
+  return { ok: rows.length > 0, rows, count: rows.length };
+}
+
 app.get("/api/gl/quote", async (req, res) => {
   const symbols = String(req.query.symbols || "").trim();
-  if (!symbols) return res.status(400).json({ error: "symbols required" });
+  if (!symbols) return res.status(400).json({ ok: false, error: "symbols required" });
 
-  const list = symbols.split(",").map(s => s.trim()).filter(Boolean).slice(0, 20);
+  const list = symbols.split(",").map(s => s.trim()).filter(Boolean).slice(0, 30);
   const quotes = [];
 
-  // stooq：每个 symbol 单独拉
-  for (const sym of list) {
-    const url = `https://stooq.com/q/l/?s=${encodeURIComponent(sym.toLowerCase())}&f=sd2t2ohlcv&h&e=csv`;
+  for (const symRaw of list) {
+    const stooqSym = normalizeStooqSymbol(symRaw);
+    const url = `https://stooq.com/q/l/?s=${encodeURIComponent(stooqSym)}&f=sd2t2ohlcv&h&e=csv`;
     const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
     if (!r.ok) continue;
-    const lines = r.text.trim().split("\n");
+
+    const lines = r.text.trim().split(/\r?\n/);
     if (lines.length < 2) continue;
+
     const parts = lines[1].split(",");
+    // Symbol,Date,Time,Open,High,Low,Close,Volume
     const close = safeNum(parts[6]);
     const date = parts[1] || null;
     const time = parts[2] || null;
 
     if (typeof close === "number") {
       quotes.push({
-        symbol: sym.toUpperCase(),
+        symbol: symRaw.toUpperCase(),
         name: null,
         price: close,
-        changePct: null,
         time: date && time ? `${date}T${time}` : new Date().toISOString(),
         currency: "USD",
-        source: "stooq"
+        source: "stooq",
+        stooqSymbol: stooqSym
       });
     }
   }
 
-  res.json({ source: "stooq", quotes });
+  res.json({ ok: true, source: "stooq", quotes });
 });
 
-/* =========================
-   AI 代理（OpenAI-compatible）
-========================= */
-app.post("/api/ai/chat", async (req, res) => {
-  const { baseUrl, apiKey, model, messages } = req.body || {};
-  if (!baseUrl || !apiKey || !model || !Array.isArray(messages)) {
-    return res.status(400).json({ error: "baseUrl/apiKey/model/messages required" });
-  }
-  const url = baseUrl.replace(/\/+$/,"") + "/chat/completions";
+app.get("/api/gl/history", async (req, res) => {
+  const symbol = String(req.query.symbol || "").trim();
+  const days = Math.min(400, Math.max(60, Number(req.query.days || 180)));
+  if (!symbol) return res.status(400).json({ ok: false, error: "symbol required" });
 
-  try {
-    const r = await fetchWithTimeout(url, {
-      method: "POST",
-      timeoutMs: 25000,
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({ model, messages })
-    });
-    res.status(r.status).send(r.text);
-  } catch (e) {
-    res.status(502).json({ error: "ai upstream error", detail: String(e) });
-  }
-});
+  const stooqSym = normalizeStooqSymbol(symbol);
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSym)}&i=d`;
+  const r = await fetchWithTimeout(url, { timeoutMs: 18000 });
+  if (!r.ok) return res.status(502).json({ ok: false, error: "stooq history fetch failed", status: r.status });
 
-/* =========================
-   主题识别（重点：别再一堆“未识别”）
-========================= */
+  const parsed = parseStooqCsv(r.text);
+  if (!parsed.ok) return res.status(502).json({ ok: false, error: parsed.reason, count: parsed.count || 0 });
 
-// 更强的“中文关键词”主题映射（基金名里常见词）
-const CN_THEME_MAP = [
-  { theme: "科创/国产科技", keys: ["科创", "芯片", "半导体", "AI", "人工智能", "算力", "光模块", "国产", "软件", "计算机", "通信", "信创", "云计算"] },
-  { theme: "港股科技", keys: ["恒生科技", "恒科", "港股科技", "港股互联网", "互联网", "腾讯", "阿里", "美团", "京东", "快手"] },
-  { theme: "医药/医疗", keys: ["医药", "医疗", "创新药", "生物", "疫苗", "CXO", "医保"] },
-  { theme: "新能源", keys: ["新能源", "光伏", "储能", "锂电", "电池", "风电", "电动车", "充电桩"] },
-  { theme: "黄金", keys: ["黄金", "金矿", "贵金属"] },
-  { theme: "白银", keys: ["白银", "银"] },
-  { theme: "石油/能源", keys: ["石油", "原油", "油气", "天然气", "能源", "煤炭"] },
-  { theme: "军工/航天/卫星", keys: ["军工", "国防", "航天", "卫星", "航空", "航发", "导弹"] },
-  { theme: "银行/金融", keys: ["银行", "金融", "券商", "保险", "证券"] },
-  { theme: "消费", keys: ["消费", "白酒", "食品饮料", "家电", "必选消费", "可选消费"] },
-  { theme: "地产", keys: ["地产", "房地产", "REIT", "REITs"] },
-  { theme: "日本", keys: ["日本", "日经"] },
-  { theme: "越南/东南亚", keys: ["越南", "东南亚", "新兴市场"] },
-  { theme: "美股/全球成长", keys: ["全球", "成长", "纳指", "NASDAQ", "标普", "S&P", "美股", "美国"] },
-];
-
-function detectThemesFromNameOrText(text) {
-  const t = String(text || "").trim();
-  if (!t) return [];
-  const hit = new Set();
-
-  const lower = t.toLowerCase();
-
-  // 英文/符号快速命中
-  if (/(qqq|nasdaq|sp500|s&p|spy)/i.test(lower)) hit.add("美股/全球成长");
-  if (/(smh|semi|nvda|nvidia)/i.test(lower)) hit.add("科创/国产科技");
-  if (/(gld|gold)/i.test(lower)) hit.add("黄金");
-  if (/(slv|silver)/i.test(lower)) hit.add("白银");
-  if (/(xle|oil|wti|brent)/i.test(lower)) hit.add("石油/能源");
-  if (/(xlv|health)/i.test(lower)) hit.add("医药/医疗");
-  if (/(ita|aero|ufo|satellite)/i.test(lower)) hit.add("军工/航天/卫星");
-
-  // 中文主题命中
-  for (const row of CN_THEME_MAP) {
-    for (const k of row.keys) {
-      if (t.includes(k)) { hit.add(row.theme); break; }
-    }
-  }
-  return Array.from(hit);
-}
-
-/* =========================
-   风控检查（组合红黄灯）
-========================= */
-app.post("/api/risk/check", (req, res) => {
-  const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
-  if (!positions.length) return res.json({ ok:true, risk:"low", suggestTotalPos: 40, topTheme:"无", topThemePct:0, notes:["无持仓"] });
-
-  // 权重：优先 mv，其次 amount
-  const baseW = positions.map(p => {
-    const mv = safeNum(p.mv);
-    const amt = safeNum(p.amount);
-    const w = (typeof mv === "number" && mv > 0) ? mv : ((typeof amt === "number" && amt > 0) ? amt : 0);
-    return w;
-  });
-  const sumW = baseW.reduce((a,b)=>a+b,0) || 1;
-
-  // 主题权重
-  const themeW = {}; // theme->weight
-  const unknownW = { w:0 };
-
-  positions.forEach((p, i) => {
-    const w = baseW[i] / sumW;
-    const name = p.name || "";
-    const code = p.code || "";
-    const themes = detectThemesFromNameOrText(`${name} ${code}`);
-
-    if (!themes.length) {
-      unknownW.w += w;
-      return;
-    }
-    for (const th of themes) themeW[th] = (themeW[th] || 0) + w;
-  });
-
-  const themePairs = Object.entries(themeW).sort((a,b)=>b[1]-a[1]);
-  const topTheme = themePairs.length ? themePairs[0][0] : "未识别";
-  const topThemePct = themePairs.length ? themePairs[0][1] * 100 : (unknownW.w * 100);
-
-  // 单一持仓占比
-  const singlePairs = positions.map((p,i)=>[p.code, (baseW[i]/sumW)*100]).sort((a,b)=>b[1]-a[1]);
-  const topPos = singlePairs[0];
-  const topPosPct = topPos?.[1] ?? 0;
-
-  // 风险等级粗规则
-  const notes = [];
-  let riskScore = 0;
-
-  if (topPosPct >= 45) { riskScore += 2; notes.push(`单一持仓占比 ${topPosPct.toFixed(1)}% 过高：${topPos[0]}`); }
-  else if (topPosPct >= 30) { riskScore += 1; notes.push(`单一持仓占比 ${topPosPct.toFixed(1)}% 偏高：${topPos[0]}`); }
-
-  if (topThemePct >= 70) { riskScore += 2; notes.push(`主题集中度 Top1 ${topThemePct.toFixed(1)}% 过高：${topTheme}`); }
-  else if (topThemePct >= 55) { riskScore += 1; notes.push(`主题集中度 Top1 ${topThemePct.toFixed(1)}% 偏高：${topTheme}`); }
-
-  const risk = riskScore >= 3 ? "high" : riskScore >= 2 ? "mid" : "low";
-  const suggestTotalPos = risk === "high" ? 60 : risk === "mid" ? 75 : 90;
-
+  const rows = parsed.rows.slice(Math.max(0, parsed.rows.length - days));
   res.json({
-    ok:true,
-    risk,
-    suggestTotalPos,
-    topTheme,
-    topThemePct,
-    backendTz: nowInfo().tz,
-    notes
+    ok: true,
+    source: "stooq",
+    symbol: symbol.toUpperCase(),
+    stooqSymbol: stooqSym,
+    count: rows.length,
+    series: rows.map(x => ({ date: x.date, value: x.close }))
   });
 });
 
 /* =========================
-   技术指标：SMA/RSI/MACD（用历史序列算）
-   - 国内基金：东财 lsjz 拉 120 条净值
-   - 海外：stooq 拉日线（用 .us）
+   技术指标：SMA/RSI/MACD/ret20
 ========================= */
-
-function sma(arr, n) {
-  if (arr.length < n) return null;
-  let s = 0;
-  for (let i = arr.length - n; i < arr.length; i++) s += arr[i];
-  return s / n;
+function sma(values, n) {
+  if (values.length < n) return null;
+  let sum = 0;
+  for (let i = values.length - n; i < values.length; i++) sum += values[i];
+  return sum / n;
 }
 
-function rsi14(closes, n = 14) {
-  if (closes.length < n + 1) return null;
+function rsi(values, n = 14) {
+  if (values.length < n + 1) return null;
   let gains = 0, losses = 0;
-  for (let i = closes.length - n; i < closes.length; i++) {
-    const diff = closes[i] - closes[i-1];
-    if (diff >= 0) gains += diff; else losses -= diff;
+  for (let i = values.length - n; i < values.length; i++) {
+    const diff = values[i] - values[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses += Math.abs(diff);
   }
   const avgGain = gains / n;
   const avgLoss = losses / n;
@@ -342,228 +363,386 @@ function rsi14(closes, n = 14) {
   return 100 - (100 / (1 + rs));
 }
 
-function ema(arr, n) {
-  if (arr.length < n) return null;
-  const k = 2 / (n + 1);
-  let v = arr[0];
-  for (let i = 1; i < arr.length; i++) v = arr[i] * k + v * (1 - k);
-  return v;
-}
-
-function macd(closes) {
-  if (closes.length < 35) return null;
-  // 经典：12/26，signal=9
-  const ema12 = [];
-  const ema26 = [];
-  const k12 = 2 / (12 + 1);
-  const k26 = 2 / (26 + 1);
-  let v12 = closes[0], v26 = closes[0];
-  for (let i = 0; i < closes.length; i++) {
-    v12 = closes[i] * k12 + v12 * (1 - k12);
-    v26 = closes[i] * k26 + v26 * (1 - k26);
-    ema12.push(v12);
-    ema26.push(v26);
+function emaSeries(values, period) {
+  if (values.length < period) return null;
+  const k = 2 / (period + 1);
+  // 先用 SMA 作为起点
+  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < values.length; i++) {
+    ema = values[i] * k + ema * (1 - k);
   }
-  const dif = ema12.map((v,i)=>v-ema26[i]);
-  const k9 = 2 / (9 + 1);
-  let sig = dif[0];
-  for (let i = 0; i < dif.length; i++) sig = dif[i] * k9 + sig * (1 - k9);
-  const hist = dif[dif.length - 1] - sig;
-  return { macd: dif[dif.length - 1], signal: sig, hist };
+  return ema;
 }
 
-async function fetchCnFundHistory(code, pageSize = 120) {
-  const url =
-    `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}` +
-    `&pageIndex=1&pageSize=${pageSize}&callback=cb&_=${Date.now()}`;
+function macd(values) {
+  // 常规 12/26，signal 9（这里返回 macdLine 与 hist 的“最后值”）
+  if (values.length < 35) return { macd: null, signal: null, hist: null };
+  const ema12 = emaSeries(values, 12);
+  const ema26 = emaSeries(values, 26);
+  if (ema12 == null || ema26 == null) return { macd: null, signal: null, hist: null };
+  const macdLine = ema12 - ema26;
 
-  const r = await fetchWithTimeout(url, { timeoutMs: 16000 });
-  if (!r.ok) return { ok:false, error:"eastmoney lsjz fetch failed", status:r.status, items:[] };
-
-  const mm = r.text.match(/cb\((\{.*\})\)/);
-  if (!mm) return { ok:false, error:"eastmoney lsjz format error", status:r.status, items:[] };
-
-  try {
-    const j = JSON.parse(mm[1]);
-    const list = j?.Data?.LSJZList || [];
-    // LSJZList 通常是倒序（最近在前），我们需要按时间升序计算指标
-    const rows = list
-      .map(x => ({ date: x.FSRQ, nav: safeNum(x.DWJZ) }))
-      .filter(x => x.date && typeof x.nav === "number")
-      .reverse();
-    return { ok:true, items: rows };
-  } catch {
-    return { ok:false, error:"eastmoney lsjz json parse error", status:200, items:[] };
+  // signal 需要 macd 序列，这里做简化：用最近 40 个 close 生成 macd 序列再算 signal
+  const macdSeq = [];
+  const start = Math.max(0, values.length - 60);
+  for (let i = start; i < values.length; i++) {
+    const slice = values.slice(0, i + 1);
+    const e12 = emaSeries(slice, 12);
+    const e26 = emaSeries(slice, 26);
+    if (e12 != null && e26 != null) macdSeq.push(e12 - e26);
   }
+  const signalLine = macdSeq.length >= 9 ? emaSeries(macdSeq, 9) : null;
+  const hist = (signalLine == null) ? null : (macdLine - signalLine);
+
+  return { macd: macdLine, signal: signalLine, hist };
 }
 
-async function fetchStooqDailyHistory(symbol) {
-  // stooq 日线：/q/d/l/?s=qqq.us&i=d
-  const sym = symbol.toLowerCase().endsWith(".us") ? symbol.toLowerCase() : (symbol.toLowerCase() + ".us");
-
-  // 关键：加 UA/Accept，避免拿到 HTML/拦截页
-  const headers = {
-    "User-Agent": "Mozilla/5.0 (compatible; InvestCopilot/1.0; +https://example.com)",
-    "Accept": "text/csv,*/*;q=0.9",
-    "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.7",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache"
-  };
-
-  // 关键：https / http 两个都试（有些环境 https 会异常，http 反而行）
-  const urls = [
-    `https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`,
-    `http://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`
-  ];
-
-  let lastText = "";
-  let lastStatus = 0;
-
-  for (const url of urls) {
-    const r = await fetchWithTimeout(url, { timeoutMs: 20000, headers });
-    lastStatus = r.status;
-    lastText = r.text || "";
-
-    if (!r.ok) continue;
-
-    // 关键：如果不是CSV而是HTML（比如返回了一个网页），直接判失败继续试下一个
-    const head = lastText.slice(0, 200).toLowerCase();
-    if (head.includes("<html") || head.includes("<!doctype") || head.includes("cloudflare")) {
-      continue;
-    }
-
-    const lines = lastText.trim().split("\n");
-    if (lines.length < 3) {
-      // 可能是空或只有表头
-      continue;
-    }
-
-    // Date,Open,High,Low,Close,Volume
-    const rows = [];
-    for (let i = 1; i < lines.length; i++) {
-      const parts = lines[i].split(",");
-      if (parts.length < 5) continue;
-      const date = parts[0];
-      const close = safeNum(parts[4]);
-      if (!date || typeof close !== "number") continue;
-      rows.push({ date, close });
-    }
-
-    return { ok: true, empty: rows.length === 0, count: rows.length, rows };
-  }
-
-  // 两个URL都失败：把前200字返回给 debug（你能一眼看出是不是HTML/拦截）
-  return {
-    ok: false,
-    status: lastStatus,
-    error: "stooq history empty or blocked",
-    sample: (lastText || "").slice(0, 200),
-    rows: []
-  };
+function retN(values, n) {
+  if (values.length < n + 1) return null;
+  const a = values[values.length - n - 1];
+  const b = values[values.length - 1];
+  if (a <= 0) return null;
+  return ((b / a) - 1) * 100;
 }
 
-function techLabel(rsi) {
-  if (typeof rsi !== "number") return { tag:"无", cls:"tagNeu" };
-  if (rsi >= 70) return { tag:"RSI偏热", cls:"tagBear" };
-  if (rsi <= 30) return { tag:"RSI偏冷", cls:"tagBull" };
-  return { tag:"RSI中性", cls:"tagNeu" };
+function rsiTag(v) {
+  if (v == null) return "RSI无数据";
+  if (v >= 70) return "RSI偏热";
+  if (v <= 30) return "RSI偏冷";
+  return "RSI中性";
 }
 
-app.post("/api/tech/indicators", async (req, res) => {
+function trendTag(last, sma20, sma60) {
+  if ([last, sma20, sma60].some(x => typeof x !== "number")) return "趋势无数据";
+  if (last > sma20 && sma20 > sma60) return "上行";
+  if (last < sma20 && sma20 < sma60) return "下行";
+  return "震荡";
+}
+
+/* =========================
+   技术指标：批量（给前端“每只持仓”用）
+   - CN_FUND：东财历史净值
+   - US_TICKER：stooq 日线
+========================= */
+app.post("/api/ta/positions", async (req, res) => {
   const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
-  if (!positions.length) return res.json({ ok:true, items:[] });
+  const days = Math.min(400, Math.max(80, Number(req.body?.days || 180)));
+  if (!positions.length) return res.status(400).json({ ok: false, error: "positions required" });
 
   const out = [];
   for (const p of positions) {
-    const type = p.type;
+    const type = String(p.type || "").trim();
     const code = String(p.code || "").trim();
     const name = p.name || null;
 
     try {
+      let series = null;
+
       if (type === "CN_FUND") {
-        const hist = await fetchCnFundHistory(code, 140);
-        const closes = hist.items.map(x => x.nav);
-        const count = closes.length;
-
-        if (!hist.ok || count < 70) {
-          out.push({
-            type, code, name,
-            ok:false,
-            reason:`insufficient history`,
-            count
-          });
+        const h = await fetchEastmoneyLSJZHistory(code, days);
+        if (!h.ok || !h.data || h.data.length < 70) {
+          out.push({ ok: false, type, code, name, reason: "insufficient history", count: h.count || 0 });
           continue;
         }
-
-        const last = closes[closes.length - 1];
-        const sma20 = sma(closes, 20);
-        const sma60 = sma(closes, 60);
-        const rsi = rsi14(closes, 14);
-        const m = macd(closes);
-        const ret20 = (closes.length >= 21) ? ((last / closes[closes.length - 21] - 1) * 100) : null;
-        const label = techLabel(rsi);
-
-        out.push({
-          type, code, name,
-          ok:true,
-          count,
-          last,
-          sma20, sma60,
-          rsi14: rsi,
-          macd: m ? m.macd : null,
-          hist: m ? m.hist : null,
-          ret20,
-          label: label.tag
-        });
-
+        series = h.data.map(x => x.value);
       } else if (type === "US_TICKER") {
-        const hist = await fetchStooqDailyHistory(code);
-        const closes = hist.rows.map(x => x.close);
-        const count = closes.length;
+        const hh = await (async () => {
+          const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(normalizeStooqSymbol(code))}&i=d`;
+          const r = await fetchWithTimeout(url, { timeoutMs: 18000 });
+          if (!r.ok) return { ok: false, reason: "stooq fetch failed", status: r.status };
+          const parsed = parseStooqCsv(r.text);
+          if (!parsed.ok) return { ok: false, reason: parsed.reason, count: parsed.count };
+          const rows = parsed.rows.slice(Math.max(0, parsed.rows.length - days));
+          return { ok: rows.length > 0, data: rows.map(x => x.close), count: rows.length };
+        })();
 
-        if (!hist.ok || count < 70) {
-          out.push({
-            type, code, name,
-            ok:false,
-            reason:`insufficient history`,
-            count
-          });
+        if (!hh.ok || !hh.data || hh.data.length < 70) {
+          out.push({ ok: false, type, code, name, reason: "insufficient history", count: hh.count || 0 });
           continue;
         }
-
-        const last = closes[closes.length - 1];
-        const sma20 = sma(closes, 20);
-        const sma60 = sma(closes, 60);
-        const rsi = rsi14(closes, 14);
-        const m = macd(closes);
-        const ret20 = (closes.length >= 21) ? ((last / closes[closes.length - 21] - 1) * 100) : null;
-        const label = techLabel(rsi);
-
-        out.push({
-          type, code, name,
-          ok:true,
-          count,
-          last,
-          sma20, sma60,
-          rsi14: rsi,
-          macd: m ? m.macd : null,
-          hist: m ? m.hist : null,
-          ret20,
-          label: label.tag
-        });
+        series = hh.data;
       } else {
-        out.push({ type, code, name, ok:false, reason:"unknown type", count:0 });
+        out.push({ ok: false, type, code, name, reason: "unknown type", count: 0 });
+        continue;
       }
+
+      const last = series[series.length - 1];
+      const sma20v = sma(series, 20);
+      const sma60v = sma(series, 60);
+      const rsi14 = rsi(series, 14);
+      const m = macd(series);
+      const ret20 = retN(series, 20);
+
+      out.push({
+        ok: true,
+        type,
+        code,
+        name,
+        last,
+        sma20: sma20v,
+        sma60: sma60v,
+        rsi14,
+        macd: m.macd,
+        hist: m.hist,
+        ret20,
+        trend: trendTag(last, sma20v, sma60v),
+        rsiTag: rsiTag(rsi14),
+        count: series.length
+      });
     } catch (e) {
-      out.push({ type, code, name, ok:false, reason:String(e), count:0 });
+      out.push({ ok: false, type, code, name, reason: String(e), count: 0 });
     }
   }
 
-  res.json({ ok:true, items: out, tz: nowInfo().tz });
+  res.json({ ok: true, items: out, tz: Intl.DateTimeFormat().resolvedOptions().timeZone || null });
 });
 
 /* =========================
-   NEWS：关键词计划 + RSS抓取（你之前那套保留）
+   主题识别（用于风控“主题集中度”）
+   - 解决你说的：显示“未识别”
+========================= */
+const THEME_RULES = [
+  { theme: "港股/恒科", tokens: ["恒生科技", "恒科", "港股科技", "港股互联网", "HKTECH", "HSTECH", "恒生", "腾讯", "阿里", "美团", "京东"] },
+  { theme: "美股/全球成长", tokens: ["全球成长", "纳指", "NASDAQ", "标普", "S&P", "QQQ", "SPY", "降息", "美联储", "CPI", "非农", "美元指数"] },
+  { theme: "科创/国产科技", tokens: ["科创50", "科创", "半导体", "芯片", "AI", "算力", "光模块", "国产替代", "硬科技"] },
+  { theme: "越南/东南亚", tokens: ["越南", "东南亚", "VN", "胡志明", "VNM"] },
+  { theme: "日本", tokens: ["日本", "日经", "日股", "日元", "央行加息"] },
+  { theme: "黄金", tokens: ["黄金", "GLD", "金价"] },
+  { theme: "原油/能源", tokens: ["原油", "WTI", "布油", "OPEC", "石油", "能源", "XLE"] },
+  { theme: "医疗", tokens: ["医药", "医疗", "医保", "创新药", "XLV"] },
+];
+
+const FUND_CODE_THEME_FALLBACK = {
+  // 你这几个常见：强兜底（不依赖名称是否先拉到）
+  "025167": "港股/恒科",
+  "011613": "科创/国产科技",
+  "012922": "美股/全球成长",
+  "019449": "日本",
+  "008764": "越南/东南亚"
+};
+
+function detectThemesFromText(text) {
+  const t = String(text || "").toLowerCase();
+  const hit = new Set();
+  for (const rule of THEME_RULES) {
+    for (const tok of rule.tokens) {
+      if (t.includes(String(tok).toLowerCase())) {
+        hit.add(rule.theme);
+        break;
+      }
+    }
+  }
+  return Array.from(hit);
+}
+
+app.post("/api/risk/check", (req, res) => {
+  const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
+  if (!positions.length) return res.status(400).json({ ok: false, error: "positions required" });
+
+  // 以 mv 优先，否则 amount
+  const weights = positions.map(p => {
+    const mv = safeNum(p.mv);
+    const amt = safeNum(p.amount);
+    return (typeof mv === "number" && mv > 0) ? mv : ((typeof amt === "number" && amt > 0) ? amt : 0);
+  });
+  const total = weights.reduce((a, b) => a + b, 0) || 1;
+
+  // 单一持仓
+  let maxW = 0;
+  let maxIdx = -1;
+  weights.forEach((w, i) => {
+    const pct = w / total;
+    if (pct > maxW) { maxW = pct; maxIdx = i; }
+  });
+
+  // 主题集中度
+  const themeMap = new Map(); // theme -> weight
+  positions.forEach((p, i) => {
+    const code = String(p.code || "").trim();
+    const name = String(p.name || "").trim();
+    const hintText = `${name} ${code} ${p.type || ""}`;
+
+    let themes = detectThemesFromText(hintText);
+
+    // 兜底：如果识别不到，就用代码兜底映射（解决“未识别”）
+    if (!themes.length && FUND_CODE_THEME_FALLBACK[code]) themes = [FUND_CODE_THEME_FALLBACK[code]];
+    if (!themes.length && code) themes = ["其他/未分类"];
+
+    const w = weights[i] / total;
+    for (const th of themes) {
+      themeMap.set(th, (themeMap.get(th) || 0) + w);
+    }
+  });
+
+  const themeList = Array.from(themeMap.entries())
+    .map(([theme, w]) => ({ theme, pct: w * 100 }))
+    .sort((a, b) => b.pct - a.pct);
+
+  const topTheme = themeList[0] || { theme: "其他/未分类", pct: 0 };
+
+  // 风险等级建议（很直白：按集中度+最大回撤/亏损提示）
+  const risk = {
+    level: (maxW >= 0.45 || topTheme.pct >= 0.65) ? "高" : (maxW >= 0.3 || topTheme.pct >= 0.45) ? "中" : "低",
+    suggestedTotalPos: (maxW >= 0.45 || topTheme.pct >= 0.65) ? 60 : (maxW >= 0.3 || topTheme.pct >= 0.45) ? 75 : 85
+  };
+
+  const warnings = [];
+  if (maxIdx >= 0 && maxW >= 0.45) {
+    warnings.push({
+      level: "高",
+      text: `单一持仓占比 ${(maxW * 100).toFixed(1)}% 过高：${positions[maxIdx]?.code || "-"} ${positions[maxIdx]?.name || ""}`.trim()
+    });
+  }
+  if (topTheme.pct >= 0.65) {
+    warnings.push({
+      level: "高",
+      text: `主题「${topTheme.theme}」集中度 ${topTheme.pct.toFixed(1)}% 过高`
+    });
+  }
+
+  res.json({
+    ok: true,
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+    risk,
+    singleMax: {
+      code: positions[maxIdx]?.code || null,
+      name: positions[maxIdx]?.name || null,
+      pct: maxW * 100
+    },
+    themeTop1: topTheme,
+    themes: themeList,
+    warnings
+  });
+});
+
+/* =========================
+   板块动向（不用 AI Key）
+   - 用一组“代表性ETF”：趋势(20/60) + 动量(20日涨跌) + RSI
+   - 解决你遇到的：stooq count=0（改为 .us + 更鲁棒解析）
+========================= */
+const SECTOR_ETFS = [
+  { theme: "全球成长&美股", symbol: "QQQ", name: "纳指100" },
+  { theme: "全球成长&美股", symbol: "SPY", name: "标普500" },
+  { theme: "科技", symbol: "XLK", name: "美股科技" },
+  { theme: "半导体", symbol: "SMH", name: "半导体" },
+  { theme: "金融/银行", symbol: "XLF", name: "金融" },
+  { theme: "医疗", symbol: "XLV", name: "医疗" },
+  { theme: "能源/石油", symbol: "XLE", name: "能源" },
+  { theme: "工业", symbol: "XLI", name: "工业" },
+  { theme: "公用事业", symbol: "XLU", name: "公用事业" },
+  { theme: "材料", symbol: "XLB", name: "材料" },
+  { theme: "消费(可选)", symbol: "XLY", name: "可选消费" },
+  { theme: "消费(必选)", symbol: "XLP", name: "必选消费" },
+  { theme: "地产", symbol: "XLRE", name: "房地产" },
+  { theme: "黄金", symbol: "GLD", name: "黄金" },
+  { theme: "白银", symbol: "SLV", name: "白银" },
+  { theme: "黄金矿业", symbol: "GDX", name: "金矿" },
+  { theme: "清洁能源", symbol: "ICLN", name: "清洁能源" },
+  { theme: "光伏", symbol: "TAN", name: "太阳能" },
+  { theme: "航天军工", symbol: "ITA", name: "航空航天" },
+  { theme: "航天/卫星", symbol: "UFO", name: "航天卫星" },
+  { theme: "新兴市场", symbol: "EEM", name: "新兴市场" },
+  { theme: "越南", symbol: "VNM", name: "越南" }
+];
+
+function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+
+function scoreSector(last, sma20v, sma60v, rsi14v, ret20v) {
+  // 趋势分：last vs SMA20/SMA60
+  let trendScore = 0;
+  if ([last, sma20v, sma60v].every(v => typeof v === "number")) {
+    if (last > sma20v && sma20v > sma60v) trendScore = 2;
+    else if (last < sma20v && sma20v < sma60v) trendScore = -2;
+    else trendScore = 0;
+  }
+
+  // 动量分：ret20
+  let momScore = 0;
+  if (typeof ret20v === "number") {
+    momScore = clamp(ret20v / 5, -2, 2); // 10%≈2分
+  }
+
+  // RSI 分：过热扣分、过冷加分（更“适合买入关注”）
+  let rsiScore = 0;
+  if (typeof rsi14v === "number") {
+    if (rsi14v >= 70) rsiScore = -1.5;
+    else if (rsi14v <= 30) rsiScore = +1.5;
+    else rsiScore = 0;
+  }
+
+  const score = trendScore + momScore + rsiScore;
+  return Math.round(score * 10) / 10; // 1位小数
+}
+
+app.get("/api/radar/sectors", async (req, res) => {
+  const days = Math.min(420, Math.max(120, Number(req.query.days || 240)));
+
+  const items = [];
+  const debug = [];
+
+  for (const it of SECTOR_ETFS) {
+    const stooqSym = normalizeStooqSymbol(it.symbol);
+    const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSym)}&i=d`;
+    const r = await fetchWithTimeout(url, { timeoutMs: 18000 });
+
+    if (!r.ok) {
+      debug.push({ symbol: it.symbol, stooq: { ok: false, status: r.status, error: r.error || "" } });
+      items.push({ ...it, ok: false, reason: "stooq fetch failed", count: 0 });
+      continue;
+    }
+
+    const parsed = parseStooqCsv(r.text);
+    debug.push({ symbol: it.symbol, stooq: { ok: parsed.ok, status: r.status, empty: !parsed.ok, count: parsed.count } });
+
+    if (!parsed.ok || parsed.rows.length < 80) {
+      items.push({ ...it, ok: false, reason: "insufficient history", count: parsed.count || 0 });
+      continue;
+    }
+
+    const rows = parsed.rows.slice(Math.max(0, parsed.rows.length - days));
+    const series = rows.map(x => x.close);
+    if (series.length < 80) {
+      items.push({ ...it, ok: false, reason: "insufficient history", count: series.length });
+      continue;
+    }
+
+    const last = series[series.length - 1];
+    const sma20v = sma(series, 20);
+    const sma60v = sma(series, 60);
+    const rsi14v = rsi(series, 14);
+    const m = macd(series);
+    const ret20v = retN(series, 20);
+    const sc = scoreSector(last, sma20v, sma60v, rsi14v, ret20v);
+
+    items.push({
+      ...it,
+      ok: true,
+      count: series.length,
+      last,
+      sma20: sma20v,
+      sma60: sma60v,
+      rsi14: rsi14v,
+      rsiTag: rsiTag(rsi14v),
+      trend: trendTag(last, sma20v, sma60v),
+      ret20: ret20v,
+      score: sc
+    });
+  }
+
+  // 输出 Top（更直观）
+  const top = items.filter(x => x.ok).slice().sort((a, b) => (b.score ?? -999) - (a.score ?? -999)).slice(0, 8);
+
+  res.json({
+    ok: true,
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone || null,
+    items,
+    top,
+    debug
+  });
+});
+
+/* =========================
+   NEWS：关键词计划 + RSS抓取（你原来的逻辑保留）
 ========================= */
 
 // 宏观固定关键词（A层）
@@ -572,7 +751,7 @@ const MACRO_BASE = [
   "中国央行","降准","降息","财政政策","汇率","人民币","美元指数",
 ];
 
-const BROAD_WORDS = new Set(["港股","A股","美股","科技","医药","新能源","能源","宏观","政策","市场"]);
+const BROAD_WORDS = new Set(["港股","A股","美股","科技","医药","新能源","能源","宏观","政策"]);
 
 function normalizeKeyword(k) {
   const s = String(k || "").trim();
@@ -596,70 +775,67 @@ function pickTopKeywords(keywords, max = 28) {
   return out;
 }
 
+// 主题->关键词（更偏“投资新闻”）
+const THEME_KW = {
+  "港股/恒科": ["恒生科技","港股互联网","腾讯","阿里","美团","港股南向资金"],
+  "美股/全球成长": ["纳斯达克","标普500","美联储","降息预期","美国CPI","非农数据"],
+  "科创/国产科技": ["科创50","半导体","AI算力","国产替代","光模块","先进制造"],
+  "越南/东南亚": ["越南股市","越南出口","东南亚制造业","新兴市场资金流"],
+  "日本": ["日本央行","日元","日经","日本加息","日债收益率"],
+  "黄金": ["黄金","金价","美债收益率","避险"],
+  "原油/能源": ["原油","WTI","OPEC","油价","能源股"],
+  "医疗": ["创新药","医保政策","集采","医疗服务"],
+  "其他/未分类": ["市场情绪","风险偏好","资金流向"]
+};
+
+// 根据持仓生成关键词计划（更稳定：先走主题识别+兜底）
 app.post("/api/news/plan", (req, res) => {
   const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
   if (!positions.length) return res.status(400).json({ ok:false, error:"positions required" });
 
-  // 权重：优先 mv，其次 amount
   const weightsBase = positions.map(p => {
     const mv = safeNum(p.mv);
     const amt = safeNum(p.amount);
-    const w = (typeof mv === "number" && mv > 0) ? mv : ((typeof amt === "number" && amt > 0) ? amt : 0);
-    return w;
+    return (typeof mv === "number" && mv > 0) ? mv : ((typeof amt === "number" && amt > 0) ? amt : 0);
   });
   const sumW = weightsBase.reduce((a,b)=>a+b,0) || 1;
 
-  // 主题命中
   const themeWeights = {};
   const themesSet = new Set();
 
   positions.forEach((p, i) => {
-    const text = `${p.name || ""} ${p.code || ""}`;
-    const themes = detectThemesFromNameOrText(text);
-    const w = weightsBase[i] / sumW;
-    if (!themes.length) return;
+    const code = String(p.code || "").trim();
+    const name = String(p.name || "").trim();
+    const text = `${name} ${code} ${p.type || ""}`;
 
+    let themes = detectThemesFromText(text);
+    if (!themes.length && FUND_CODE_THEME_FALLBACK[code]) themes = [FUND_CODE_THEME_FALLBACK[code]];
+    if (!themes.length) themes = ["其他/未分类"];
+
+    const w = weightsBase[i] / sumW;
     for (const th of themes) {
       themesSet.add(th);
       themeWeights[th] = (themeWeights[th] || 0) + w;
     }
   });
 
-  if (themesSet.size === 0) {
-    themesSet.add("宏观");
-    themeWeights["宏观"] = 1;
-  }
-
   const themes = Array.from(themesSet).sort((a,b)=>(themeWeights[b]||0)-(themeWeights[a]||0));
 
-  const themeToKeywords = {
-    "港股科技": ["恒生科技","港股互联网","腾讯","阿里","美团","港股科技ETF"],
-    "科创/国产科技": ["科创50","半导体","AI算力","国产替代","光模块","高端制造"],
-    "美股/全球成长": ["纳斯达克","标普500","美联储","降息预期","美国CPI","科技巨头"],
-    "越南/东南亚": ["越南股市","越南出口","东南亚制造业","新兴市场"],
-    "医药/医疗": ["创新药","医保政策","集采","医疗服务","医药股"],
-    "新能源": ["光伏","储能","锂电","新能源车"],
-    "黄金": ["黄金","金价","避险资产"],
-    "白银": ["白银","银价","贵金属"],
-    "石油/能源": ["原油","WTI","布油","OPEC","油气"],
-    "军工/航天/卫星": ["军工","航天","卫星","国防预算"],
-    "银行/金融": ["银行","券商","利率","金融监管"],
-    "消费": ["消费","白酒","食品饮料","家电"],
-    "地产": ["房地产","地产政策","REITs"],
-    "日本": ["日本央行","日经","日元汇率"],
-    "宏观": ["美联储","中国央行","政策","通胀"]
-  };
-
+  // C层：标的强相关（用“代码+关键名词”短化）
   const instrumentHints = [];
   for (const p of positions) {
-    if (!p.name) continue;
-    const n = String(p.name).trim();
-    // 从基金名里抽“短核心词”（常见：恒生科技/科创50/越南/日本/医药/黄金等）
-    for (const th of themes) {
-      if (n.includes(th.replace("&",""))) instrumentHints.push(th);
-    }
-    for (const row of CN_THEME_MAP) {
-      for (const k of row.keys) if (n.includes(k)) { instrumentHints.push(k); break; }
+    const code = String(p.code || "").trim();
+    const name = String(p.name || "").trim();
+    if (name) {
+      if (name.includes("恒生科技")) instrumentHints.push("恒生科技");
+      if (name.includes("科创50")) instrumentHints.push("科创50");
+      if (name.includes("越南")) instrumentHints.push("越南股市");
+      if (name.includes("日本")) instrumentHints.push("日本股市");
+      // 避免整句：截短
+      instrumentHints.push(name.slice(0, 12));
+    } else if (code) {
+      // 没名字也给个兜底
+      instrumentHints.push(code);
     }
   }
 
@@ -672,20 +848,19 @@ app.post("/api/news/plan", (req, res) => {
   }
 
   for (const k of MACRO_BASE) addKw(k, 0.35);
-
   for (const t of themes) {
     const tw = themeWeights[t] || 0.1;
-    const ks = themeToKeywords[t] || [];
+    const ks = THEME_KW[t] || THEME_KW["其他/未分类"];
     for (const k of ks) addKw(k, 0.6 * tw + 0.15);
   }
-
-  for (const k of instrumentHints) addKw(k, 0.75);
+  for (const k of instrumentHints) addKw(k, 0.6);
 
   const keywords = pickTopKeywords(
     Object.entries(kwWeight).sort((a,b)=>b[1]-a[1]).map(x=>x[0]),
     28
   );
 
+  // weights 给 rss 分配配额
   const weights = {};
   let sumK = 0;
   for (const k of keywords) sumK += (kwWeight[k] || 0.1);
@@ -697,23 +872,20 @@ app.post("/api/news/plan", (req, res) => {
     themes,
     themeWeights,
     keywords,
-    weights,
-    buckets: {
-      macro: MACRO_BASE,
-      theme: themes.flatMap(t => themeToKeywords[t] || []),
-      instrument: instrumentHints
-    }
+    weights
   });
 });
 
+// Google News RSS search
 function googleNewsRssUrl(keyword) {
   const q = encodeURIComponent(keyword);
   return `https://news.google.com/rss/search?q=${q}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans`;
 }
 
+// 极简 RSS 解析
 function parseRssItems(xml) {
   const items = [];
-  const blocks = xml.split(/<\/item>/i);
+  const blocks = String(xml || "").split(/<\/item>/i);
   for (const b of blocks) {
     if (!/<item>/i.test(b)) continue;
     const getTag = (tag) => {
@@ -749,13 +921,13 @@ function scoreItem(item, keyword) {
   const k = (keyword || "").toLowerCase();
 
   let score = 0;
+
   if (k && text.includes(k)) score += 2;
 
-  const themes = detectThemesFromNameOrText(text);
+  const themes = detectThemesFromText(text);
   if (themes.length) score += Math.min(2, themes.length);
 
-  if (/(etf|指数|基金|利率|降息|加息|央行|cpi|pce|非农|财报|业绩)/i.test(text)) score += 1;
-
+  if (/(etf|指数|基金|利率|降息|加息|央行|cpi|pce|非农|财报|业绩|资金流|汇率|收益率)/i.test(text)) score += 1;
   if (/(八卦|塌房|吃瓜|爆料|热辣|绯闻)/i.test(text)) score -= 1;
 
   return { score, themes };
@@ -804,7 +976,7 @@ function allocateQuota(keywords, limit, weightsObj) {
 
 app.get("/api/news/rss", async (req, res) => {
   const keywordsStr = String(req.query.keywords || "").trim();
-  const limit = Math.min(30, Math.max(3, Number(req.query.limit || 12)));
+  const limit = Math.min(24, Math.max(3, Number(req.query.limit || 12)));
   const minScore = Number(req.query.minScore || 2);
 
   if (!keywordsStr) return res.status(400).json({ ok:false, error:"keywords required" });
@@ -824,39 +996,37 @@ app.get("/api/news/rss", async (req, res) => {
     const q = quota[kw] || 1;
     const url = googleNewsRssUrl(kw);
 
-    try {
-      const r = await fetchWithTimeout(url, { timeoutMs: 16000 });
-      if (!r.ok) {
-        debug.push({ source:"google_news_rss", keyword: kw, ok:false, status:r.status });
-        continue;
-      }
-      const items = parseRssItems(r.text);
-      debug.push({ source:"google_news_rss", keyword: kw, ok:true, status:200 });
-
-      const scored = [];
-      for (const it of items) {
-        const { score, themes } = scoreItem(it, kw);
-        if (score < minScore) continue;
-
-        const sentiment = sentimentFromText(`${it.title} ${it.description}`);
-        scored.push({
-          title: it.title,
-          link: it.link,
-          pubDate: it.pubDate,
-          description: it.description,
-          keyword: kw,
-          source: "google_news_rss",
-          score,
-          themes,
-          sentiment
-        });
-      }
-
-      scored.sort((a,b)=>b.score-a.score);
-      all.push(...scored.slice(0, q));
-    } catch (e) {
-      debug.push({ source:"google_news_rss", keyword: kw, ok:false, error:String(e) });
+    const r = await fetchWithTimeout(url, { timeoutMs: 16000 });
+    if (!r.ok) {
+      debug.push({ source:"google_news_rss", keyword: kw, ok:false, status:r.status, error:r.error || "" });
+      continue;
     }
+
+    const items = parseRssItems(r.text);
+    debug.push({ source:"google_news_rss", keyword: kw, ok:true, status:200 });
+
+    const scored = [];
+    for (const it of items) {
+      const { score, themes } = scoreItem(it, kw);
+      if (score < minScore) continue;
+
+      const sentiment = sentimentFromText(`${it.title} ${it.description}`);
+
+      scored.push({
+        title: it.title,
+        link: it.link,
+        pubDate: it.pubDate,
+        description: it.description,
+        keyword: kw,
+        source: "google_news_rss",
+        score,
+        themes,
+        sentiment
+      });
+    }
+
+    scored.sort((a,b)=>b.score-a.score);
+    all.push(...scored.slice(0, q));
   }
 
   const seen = new Set();
@@ -872,131 +1042,26 @@ app.get("/api/news/rss", async (req, res) => {
 });
 
 /* =========================
-   板块动向：全板块清单（不用AI Key）
-   - 用代表性 ETF（stooq 日线）计算：趋势 + 动量 + RSI
-   - 你要“航天/卫星/黄金/白银/石油/医疗…”都在这里
+   AI 代理（OpenAI-compatible）
 ========================= */
-
-const SECTOR_ETFS = [
-  { theme: "全球成长&美股", symbol: "QQQ", name: "纳指100" },
-  { theme: "全球成长&美股", symbol: "SPY", name: "标普500" },
-
-  { theme: "科技", symbol: "XLK", name: "美股科技" },
-  { theme: "半导体", symbol: "SMH", name: "半导体" },
-  { theme: "金融/银行", symbol: "XLF", name: "金融" },
-  { theme: "医疗", symbol: "XLV", name: "医疗" },
-  { theme: "能源/石油", symbol: "XLE", name: "能源" },
-
-  { theme: "工业", symbol: "XLI", name: "工业" },
-  { theme: "公用事业", symbol: "XLU", name: "公用事业" },
-  { theme: "材料", symbol: "XLB", name: "材料" },
-  { theme: "消费(可选)", symbol: "XLY", name: "可选消费" },
-  { theme: "消费(必选)", symbol: "XLP", name: "必选消费" },
-  { theme: "地产", symbol: "XLRE", name: "地产REIT" },
-
-  { theme: "黄金", symbol: "GLD", name: "黄金" },
-  { theme: "白银", symbol: "SLV", name: "白银" },
-  { theme: "金矿", symbol: "GDX", name: "金矿股" },
-
-  { theme: "新能源", symbol: "ICLN", name: "清洁能源" },
-  { theme: "光伏", symbol: "TAN", name: "太阳能" },
-
-  { theme: "军工/航天", symbol: "ITA", name: "军工航天" },
-  { theme: "卫星/太空", symbol: "UFO", name: "卫星/太空" },
-
-  { theme: "新兴市场", symbol: "EEM", name: "新兴市场" },
-  { theme: "越南", symbol: "VNM", name: "越南" },
-];
-
-function sectorScore({ trendUp, ret20, rsi }) {
-  let s = 0;
-  if (trendUp) s += 2; // 趋势
-  if (typeof ret20 === "number") {
-    if (ret20 >= 6) s += 2;
-    else if (ret20 >= 2) s += 1;
-    else if (ret20 <= -6) s -= 2;
-    else if (ret20 <= -2) s -= 1;
+app.post("/api/ai/chat", async (req, res) => {
+  const { baseUrl, apiKey, model, messages } = req.body || {};
+  if (!baseUrl || !apiKey || !model || !Array.isArray(messages)) {
+    return res.status(400).json({ error: "baseUrl/apiKey/model/messages required" });
   }
-  if (typeof rsi === "number") {
-    if (rsi >= 70) s -= 1;  // 偏热：不加分，避免追高（你要“一目了然”）
-    else if (rsi <= 35) s += 1; // 偏冷：可能出现反弹机会（仅提示）
-  }
-  return s;
-}
+  const url = baseUrl.replace(/\/+$/,"") + "/chat/completions";
 
-function heatLabel(ret20) {
-  if (typeof ret20 !== "number") return { tag:"未知", cls:"neu" };
-  if (ret20 >= 6) return { tag:"🔥升温", cls:"bull" };
-  if (ret20 >= 2) return { tag:"↗上行", cls:"bull" };
-  if (ret20 <= -6) return { tag:"🧊转弱", cls:"bear" };
-  if (ret20 <= -2) return { tag:"↘回落", cls:"bear" };
-  return { tag:"😐稳定", cls:"neu" };
-}
-
-function moodLabel(rsi) {
-  if (typeof rsi !== "number") return { tag:"未知", cls:"neu" };
-  if (rsi >= 70) return { tag:"RSI偏热", cls:"bear" };
-  if (rsi <= 30) return { tag:"RSI偏冷", cls:"bull" };
-  return { tag:"RSI中性", cls:"neu" };
-}
-
-app.get("/api/radar/sectors", async (req, res) => {
-  const limit = Math.min(60, Math.max(10, Number(req.query.limit || 60)));
-  const out = [];
-  const debug = [];
-
-  for (const etf of SECTOR_ETFS) {
-    const symbol = etf.symbol;
-    const hist = await fetchStooqDailyHistory(symbol); // 自动 .us
-    debug.push({ symbol, stooq: hist.ok ? { ok:true, empty: !!hist.empty, count: hist.count } : { ok:false, status: hist.status } });
-
-    if (!hist.ok || !hist.rows || hist.rows.length < 70) {
-      out.push({
-        theme: etf.theme,
-        symbol,
-        name: etf.name,
-        ok:false,
-        reason:"insufficient history",
-        count: hist.rows ? hist.rows.length : 0
-      });
-      continue;
-    }
-
-    const closes = hist.rows.map(x => x.close);
-    const last = closes[closes.length - 1];
-    const sma20 = sma(closes, 20);
-    const sma60 = sma(closes, 60);
-    const trendUp = (typeof sma20 === "number" && typeof sma60 === "number") ? (sma20 > sma60) : null;
-    const rsi = rsi14(closes, 14);
-    const ret20 = (closes.length >= 21) ? ((last / closes[closes.length - 21] - 1) * 100) : null;
-
-    const score = sectorScore({ trendUp, ret20, rsi });
-    const heat = heatLabel(ret20);
-    const mood = moodLabel(rsi);
-
-    out.push({
-      ok:true,
-      theme: etf.theme,
-      symbol,
-      name: etf.name,
-      last,
-      ret20,
-      rsi14: rsi,
-      trendUp,
-      score,
-      tags: [heat.tag, mood.tag, trendUp ? "趋势偏强" : "趋势偏弱"]
-    });
-  }
-
-  // 按 score 排序（高->低），但返回“全清单”
-  out.sort((a,b)=>(Number(b.score||-999)-Number(a.score||-999)));
-
-  res.json({
-    ok:true,
-    items: out.slice(0, limit),
-    debug,
-    tz: nowInfo().tz
+  const r = await fetchWithTimeout(url, {
+    method: "POST",
+    timeoutMs: 25000,
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({ model, messages })
   });
+
+  res.status(r.status || 502).send(r.text || JSON.stringify({ error: "ai upstream error" }));
 });
 
 /* =========================
@@ -1004,5 +1069,5 @@ app.get("/api/radar/sectors", async (req, res) => {
 ========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("server listening on", PORT, nowInfo());
+  console.log("server listening on", PORT, nowInfo(), "envTZ=", process.env.TZ || null);
 });
