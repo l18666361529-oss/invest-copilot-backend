@@ -400,24 +400,66 @@ async function fetchCnFundHistory(code, pageSize = 120) {
 async function fetchStooqDailyHistory(symbol) {
   // stooq 日线：/q/d/l/?s=qqq.us&i=d
   const sym = symbol.toLowerCase().endsWith(".us") ? symbol.toLowerCase() : (symbol.toLowerCase() + ".us");
-  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`;
-  const r = await fetchWithTimeout(url, { timeoutMs: 16000 });
-  if (!r.ok) return { ok:false, status:r.status, error:"stooq history fetch failed", rows:[] };
 
-  const lines = r.text.trim().split("\n");
-  if (lines.length < 3) return { ok:true, empty:true, count:0, rows:[] };
+  // 关键：加 UA/Accept，避免拿到 HTML/拦截页
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (compatible; InvestCopilot/1.0; +https://example.com)",
+    "Accept": "text/csv,*/*;q=0.9",
+    "Accept-Language": "en-US,en;q=0.8,zh-CN;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache"
+  };
 
-  // Date,Open,High,Low,Close,Volume
-  const rows = [];
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(",");
-    if (parts.length < 5) continue;
-    const date = parts[0];
-    const close = safeNum(parts[4]);
-    if (!date || typeof close !== "number") continue;
-    rows.push({ date, close });
+  // 关键：https / http 两个都试（有些环境 https 会异常，http 反而行）
+  const urls = [
+    `https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`,
+    `http://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`
+  ];
+
+  let lastText = "";
+  let lastStatus = 0;
+
+  for (const url of urls) {
+    const r = await fetchWithTimeout(url, { timeoutMs: 20000, headers });
+    lastStatus = r.status;
+    lastText = r.text || "";
+
+    if (!r.ok) continue;
+
+    // 关键：如果不是CSV而是HTML（比如返回了一个网页），直接判失败继续试下一个
+    const head = lastText.slice(0, 200).toLowerCase();
+    if (head.includes("<html") || head.includes("<!doctype") || head.includes("cloudflare")) {
+      continue;
+    }
+
+    const lines = lastText.trim().split("\n");
+    if (lines.length < 3) {
+      // 可能是空或只有表头
+      continue;
+    }
+
+    // Date,Open,High,Low,Close,Volume
+    const rows = [];
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].split(",");
+      if (parts.length < 5) continue;
+      const date = parts[0];
+      const close = safeNum(parts[4]);
+      if (!date || typeof close !== "number") continue;
+      rows.push({ date, close });
+    }
+
+    return { ok: true, empty: rows.length === 0, count: rows.length, rows };
   }
-  return { ok:true, empty: rows.length === 0, count: rows.length, rows };
+
+  // 两个URL都失败：把前200字返回给 debug（你能一眼看出是不是HTML/拦截）
+  return {
+    ok: false,
+    status: lastStatus,
+    error: "stooq history empty or blocked",
+    sample: (lastText || "").slice(0, 200),
+    rows: []
+  };
 }
 
 function techLabel(rsi) {
