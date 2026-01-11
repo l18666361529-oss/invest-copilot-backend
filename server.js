@@ -407,7 +407,7 @@ async function fetchAlphaVantageDaily(symbol, count = 240) {
   if (cached) return cached;
 
   const url =
-    `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED` +
+    `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY` +
     `&symbol=${encodeURIComponent(sym)}&outputsize=full&apikey=${encodeURIComponent(AV_KEY)}`;
 
   const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
@@ -451,7 +451,7 @@ async function fetchAlphaVantageDaily(symbol, count = 240) {
     const series = [];
     for (const d of dates) {
       const row = ts[d];
-      const close = safeNum(row?.["5. adjusted close"] ?? row?.["4. close"]);
+      const close = safeNum(row?.["4. close"]);
       if (typeof close === "number") series.push({ date: d, close });
     }
 
