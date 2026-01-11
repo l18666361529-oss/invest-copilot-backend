@@ -120,7 +120,8 @@ function normFundCode(codeRaw) {
 /* =========================
    Health / Debug
 ========================= */
-app.get("/health", (_req, res) => res.json({ ok: true }));
+const BUILD_ID = new Date().toISOString();
+app.get("/health", (_req, res) => res.json({ ok: true, build: BUILD_ID }));
 app.get("/api/debug/time", (_req, res) => res.json({ ok: true, ...nowInfo() }));
 
 /* =========================
