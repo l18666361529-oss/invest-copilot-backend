@@ -41,7 +41,7 @@ function nowInfo() {
 }
 
 /* =========================
-   请求封装：补 UA/Referer
+   请求封装：补 UA/Referer（减少被上游拦）
 ========================= */
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
@@ -103,7 +103,7 @@ function normFundCode(codeRaw) {
 }
 
 /* =========================
-   Health
+   Health / Debug
 ========================= */
 app.get("/health", (_req, res) => res.json({ ok: true, build: BUILD_ID }));
 app.get("/api/debug/time", (_req, res) => res.json({ ok: true, build: BUILD_ID, ...nowInfo() }));
@@ -131,6 +131,7 @@ function extractJsVar(js, varName) {
 function toJsonLikeArray(raw) {
   let s = raw.trim();
   if (!s.startsWith("[")) return null;
+  // 把 {x:1,y:2} -> {"x":1,"y":2}
   s = s.replace(/([{,]\s*)([a-zA-Z_]\w*)\s*:/g, '$1"$2":');
   return s;
 }
@@ -283,7 +284,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
 /* =========================
    国内基金：历史净值（lsjz -> pingzhongdata 兜底）
 ========================= */
-async function fetchCnFundHistory(code, count = 160) {
+async function fetchCnFundHistory(code, count = 180) {
   const url =
     `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}` +
     `&pageIndex=1&pageSize=${Math.min(200, Math.max(30, count))}&callback=cb&_=${Date.now()}`;
@@ -298,7 +299,7 @@ async function fetchCnFundHistory(code, count = 160) {
         const series = list
           .map((x) => ({ date: x.FSRQ, close: safeNum(x.DWJZ) }))
           .filter((x) => x.date && typeof x.close === "number")
-          .reverse();
+          .reverse(); // old->new
         if (series.length) return { ok: true, series, source: "eastmoney_lsjz" };
       } catch {}
     }
@@ -338,7 +339,7 @@ function parseCsvLines(csv) {
 /* =========================
    stooq：主源（com + pl）+ debug
 ========================= */
-async function fetchStooqHistory(symbol, count = 220) {
+async function fetchStooqHistory(symbol, count = 240) {
   const s = ensureStooqSymbol(symbol);
   const urls = [
     `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`,
@@ -360,7 +361,7 @@ async function fetchStooqHistory(symbol, count = 220) {
     const head = text.slice(0, 200);
     const textLen = text.length;
 
-    // 不是 CSV（HTML/限流文字）
+    // HTML / 非CSV
     if (/^\s*</.test(text) || /<html/i.test(text) || /Too Many Requests/i.test(text)) {
       lastDbg = { url, status: r.status, textLen, head, kind: "non-csv(html/ratelimit)" };
       continue;
@@ -368,7 +369,7 @@ async function fetchStooqHistory(symbol, count = 220) {
 
     const rows = parseCsvLines(text);
     if (!rows.length) {
-      // 注意：stooq 会返回一行“限流文字”，这种情况下 rows 会是 0
+      // stooq 有时会返回一行“超过调用限制”的文字，这里会走到 empty
       lastDbg = { url, status: r.status, textLen, head, kind: "empty-csv" };
       continue;
     }
@@ -380,28 +381,29 @@ async function fetchStooqHistory(symbol, count = 220) {
 }
 
 /* =========================
-   Alpha Vantage 备用源（你已配置 ALPHAVANTAGE_KEY）
-   + 缓存（避免免费额度打爆）
+   Alpha Vantage：备用源 + 缓存（避免免费额度爆）
 ========================= */
 const AV_KEY = process.env.ALPHAVANTAGE_KEY || "";
-const marketCache = new Map(); // key -> {ts, data}
-function cacheGet(key, ttlMs) {
+
+// ✅ 缓存：成功缓存久一点；失败缓存很短
+const marketCache = new Map(); // key -> {ts, ttlMs, data}
+function cacheGet(key) {
   const it = marketCache.get(key);
   if (!it) return null;
-  if (Date.now() - it.ts > ttlMs) return null;
+  if (Date.now() - it.ts > it.ttlMs) return null;
   return it.data;
 }
-function cacheSet(key, data) {
-  marketCache.set(key, { ts: Date.now(), data });
+function cacheSet(key, data, ttlMs) {
+  marketCache.set(key, { ts: Date.now(), ttlMs, data });
 }
 
-async function fetchAlphaVantageDaily(symbol, count = 220) {
+async function fetchAlphaVantageDaily(symbol, count = 240) {
   const sym = String(symbol || "").trim().toUpperCase();
   if (!sym) return { ok: false, reason: "symbol required" };
   if (!AV_KEY) return { ok: false, reason: "no alphavantage key" };
 
   const cacheKey = `av:${sym}`;
-  const cached = cacheGet(cacheKey, 6 * 60 * 60 * 1000); // 6小时
+  const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
   const url =
@@ -409,26 +411,39 @@ async function fetchAlphaVantageDaily(symbol, count = 220) {
     `&symbol=${encodeURIComponent(sym)}&outputsize=full&apikey=${encodeURIComponent(AV_KEY)}`;
 
   const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+  const rawHead = (r.text || "").slice(0, 300);
+
   if (!r.ok) {
-    const data = { ok: false, reason: `alphavantage status=${r.status}` };
-    cacheSet(cacheKey, data);
+    const data = { ok: false, reason: `alphavantage status=${r.status}`, head: rawHead };
+    cacheSet(cacheKey, data, 2 * 60 * 1000); // 失败只缓存2分钟
     return data;
   }
 
   try {
     const j = JSON.parse(r.text);
 
-    // 免费版触发频率限制会给 Note
-    if (j.Note || j["Error Message"]) {
-      const data = { ok: false, reason: "alphavantage limited/error", detail: j.Note || j["Error Message"] };
-      cacheSet(cacheKey, data);
+    // ✅ Alpha Vantage 常见错误/限流字段：Note / Information / Error Message
+    const info = j.Note || j.Information || j["Error Message"];
+    if (info) {
+      const data = {
+        ok: false,
+        reason: "alphavantage limited/error",
+        detail: info,
+        keys: Object.keys(j),
+        head: rawHead,
+      };
+      cacheSet(cacheKey, data, 2 * 60 * 1000); // 限流/错误只缓存2分钟
       return data;
     }
 
     const ts = j["Time Series (Daily)"];
     if (!ts || typeof ts !== "object") {
-      const data = { ok: false, reason: "alphavantage missing timeseries" };
-      cacheSet(cacheKey, data);
+      const data = {
+        ok: false,
+        reason: "alphavantage missing timeseries",
+        detail: { keys: Object.keys(j), head: rawHead },
+      };
+      cacheSet(cacheKey, data, 2 * 60 * 1000);
       return data;
     }
 
@@ -442,33 +457,32 @@ async function fetchAlphaVantageDaily(symbol, count = 220) {
 
     const data = series.length
       ? { ok: true, series: series.slice(-count), source: "alphavantage" }
-      : { ok: false, reason: "alphavantage empty" };
+      : { ok: false, reason: "alphavantage empty", detail: { head: rawHead } };
 
-    cacheSet(cacheKey, data);
+    // ✅ 成功缓存6小时；空数据缓存10分钟
+    cacheSet(cacheKey, data, data.ok ? 6 * 60 * 60 * 1000 : 10 * 60 * 1000);
     return data;
   } catch (e) {
-    const data = { ok: false, reason: `alphavantage parse failed: ${String(e)}` };
-    cacheSet(cacheKey, data);
+    const data = { ok: false, reason: `alphavantage parse failed: ${String(e)}`, head: rawHead };
+    cacheSet(cacheKey, data, 2 * 60 * 1000);
     return data;
   }
 }
 
 /* =========================
-   市场历史：stooq -> AlphaVantage 自动兜底
+   市场历史：stooq -> alphavantage 自动兜底
 ========================= */
-async function fetchMarketHistory(symbol, count = 220) {
-  // 1) stooq
+async function fetchMarketHistory(symbol, count = 240) {
   const s = await fetchStooqHistory(symbol, count);
   if (s.ok) return { ok: true, series: s.series, source: "stooq", usedUrl: s.usedUrl };
 
-  // 2) AlphaVantage（缓存）
   const av = await fetchAlphaVantageDaily(symbol, count);
   if (av.ok) return { ok: true, series: av.series, source: "alphavantage" };
 
   return {
     ok: false,
     reason: `stooq failed (${s.reason}); alphavantage failed (${av.reason})`,
-    debug: { stooq: s.debug || null, alphavantage: av.detail || null, build: BUILD_ID },
+    debug: { stooq: s.debug || null, alphavantage: av.detail || av.head || null, build: BUILD_ID },
   };
 }
 
@@ -567,10 +581,10 @@ app.get("/api/tech/cnfund/:code", async (req, res) => {
   if (!code) return res.status(400).json({ ok: false, error: "fund code must be digits (<=6)" });
 
   const hist = await fetchCnFundHistory(code, 180);
-  if (!hist.ok) return res.json({ ok: false, code, reason: hist.reason || "history fetch failed", count: 0 });
+  if (!hist.ok) return res.json({ ok: false, code, reason: hist.reason || "history fetch failed", count: 0, build: BUILD_ID });
 
   const ind = calcIndicatorsFromSeries(hist.series);
-  if (ind.count < 60) return res.json({ ok: false, code, reason: "insufficient history", count: ind.count });
+  if (ind.count < 60) return res.json({ ok: false, code, reason: "insufficient history", count: ind.count, build: BUILD_ID });
 
   res.json({ ok: true, code, historySource: hist.source || null, ...ind, build: BUILD_ID });
 });
@@ -588,7 +602,7 @@ app.get("/api/tech/stooq/:symbol", async (req, res) => {
   }
 
   const ind = calcIndicatorsFromSeries(hist.series);
-  if (ind.count < 60) return res.json({ ok: false, symbol, reason: "insufficient history", count: ind.count, build: BUILD_ID });
+  if (ind.count < 60) return res.json({ ok: false, symbol, reason: "insufficient history", count: ind.count, source: hist.source, build: BUILD_ID });
 
   res.json({ ok: true, symbol, source: hist.source, usedUrl: hist.usedUrl || null, ...ind, build: BUILD_ID });
 });
@@ -623,7 +637,6 @@ app.post("/api/tech/batch", async (req, res) => {
       continue;
     }
 
-    // 海外 ticker（用市场兜底逻辑）
     if (type === "US_TICKER" || type === "SECTOR_ETF") {
       const hist = await fetchMarketHistory(codeRaw, 240);
       if (!hist.ok) {
@@ -646,18 +659,16 @@ app.post("/api/tech/batch", async (req, res) => {
    主题识别（风控用）
 ========================= */
 const THEME_RULES = [
-  {
-    theme: "港股科技",
-    tokens: ["恒生科技", "恒科", "港股科技", "港股互联网", "港股通", "中国科技", "中国互联网", "中概互联", "互联网", "腾讯", "阿里", "美团", "京东", "快手"],
-  },
+  { theme: "港股科技", tokens: ["恒生科技", "恒科", "港股科技", "港股互联网", "港股通", "中国科技", "中国互联网", "中概互联", "互联网", "腾讯", "阿里", "美团", "京东", "快手"] },
   { theme: "全球成长&美股", tokens: ["全球", "QDII", "全球成长", "全球精选", "纳指", "NASDAQ", "美股", "美国", "标普", "S&P", "SPY", "QQQ"] },
   { theme: "日本", tokens: ["日本", "日经", "日本精选", "日元"] },
   { theme: "越南/东南亚", tokens: ["越南", "东南亚"] },
-  { theme: "黄金/贵金属", tokens: ["黄金", "金价", "白银", "贵金属"] },
-  { theme: "新能源", tokens: ["新能源", "光伏", "储能", "锂电", "电池", "风电", "电动车"] },
-  { theme: "医药", tokens: ["医药", "创新药", "医疗", "生物科技", "CXO", "集采"] },
-  { theme: "军工", tokens: ["军工", "国防", "航空", "航天"] },
   { theme: "煤炭", tokens: ["煤炭"] },
+  { theme: "军工", tokens: ["军工", "国防", "航空", "航天"] },
+  { theme: "AI", tokens: ["AI", "人工智能"] },
+  { theme: "机器人", tokens: ["机器人"] },
+  { theme: "医药", tokens: ["医药", "创新药", "医疗", "生物科技", "CXO", "集采"] },
+  { theme: "新能源", tokens: ["新能源", "光伏", "储能", "锂电", "电池", "风电", "电动车"] },
   { theme: "印度", tokens: ["印度"] },
 ];
 
@@ -699,8 +710,12 @@ app.post("/api/risk/check", (req, res) => {
     const text = `${p.name || ""} ${p.code || ""}`;
     const themes = detectThemesFromText(text);
     const w = wBase[i] / sumW;
-    if (!themes.length) themeMap["未识别"] = (themeMap["未识别"] || 0) + w;
-    else for (const t of themes) themeMap[t] = (themeMap[t] || 0) + w;
+
+    if (!themes.length) {
+      themeMap["未识别"] = (themeMap["未识别"] || 0) + w;
+    } else {
+      for (const t of themes) themeMap[t] = (themeMap[t] || 0) + w;
+    }
   }
 
   const themePairs = Object.entries(themeMap).sort((a, b) => b[1] - a[1]);
@@ -759,7 +774,7 @@ app.post("/api/sector/scan", async (req, res) => {
   const out = [];
   const debug = [];
 
-  // 免费 key 避免被打爆：限制一次最多 20 个
+  // 免费 key 防爆：每次最多 20 个
   const MAX = 20;
 
   for (const it of items.slice(0, MAX)) {
