@@ -397,7 +397,7 @@ function cacheSet(key, data, ttlMs) {
   marketCache.set(key, { ts: Date.now(), ttlMs, data });
 }
 
-async function fetchAlphaVantageDaily(symbol, count = 240) {
+async function fetchAlphaVantageDaily(symbol, count = 120) {
   const sym = String(symbol || "").trim().toUpperCase();
   if (!sym) return { ok: false, reason: "symbol required" };
   if (!AV_KEY) return { ok: false, reason: "no alphavantage key" };
@@ -407,8 +407,8 @@ async function fetchAlphaVantageDaily(symbol, count = 240) {
   if (cached) return cached;
 
   const url =
-    `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY` +
-    `&symbol=${encodeURIComponent(sym)}&outputsize=full&apikey=${encodeURIComponent(AV_KEY)}`;
+  `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY` +
+  `&symbol=${encodeURIComponent(sym)}&outputsize=compact&apikey=${encodeURIComponent(AV_KEY)}`;
 
   const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
   const rawHead = (r.text || "").slice(0, 300);
