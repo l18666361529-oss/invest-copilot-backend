@@ -6,7 +6,7 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 /* =========================
-   Build ID（用来确认是否部署到最新版本）
+   Build ID（确认是否部署最新）
 ========================= */
 const BUILD_ID = new Date().toISOString();
 
@@ -41,7 +41,7 @@ function nowInfo() {
 }
 
 /* =========================
-   上游请求：自动补 UA/Referer（防止东财/stooq 回空）
+   请求封装：补 UA/Referer
 ========================= */
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
@@ -64,8 +64,9 @@ function headersForUrl(url, headers = {}) {
     if (host.includes("stooq.com") || host.includes("stooq.pl")) {
       h.Referer ||= "https://stooq.com/";
     }
-    if (host.includes("news.google.com")) {
-      h.Referer ||= "https://news.google.com/";
+    if (host.includes("alphavantage.co")) {
+      h.Referer ||= "https://www.alphavantage.co/";
+      h.Accept ||= "application/json";
     }
   } catch {}
 
@@ -102,16 +103,13 @@ function normFundCode(codeRaw) {
 }
 
 /* =========================
-   Health / Debug
+   Health
 ========================= */
 app.get("/health", (_req, res) => res.json({ ok: true, build: BUILD_ID }));
-
-app.get("/api/debug/time", (_req, res) => {
-  res.json({ ok: true, build: BUILD_ID, ...nowInfo() });
-});
+app.get("/api/debug/time", (_req, res) => res.json({ ok: true, build: BUILD_ID, ...nowInfo() }));
 
 /* =========================
-   国内基金兜底：pingzhongdata
+   pingzhongdata 兜底（基金名称/历史净值）
 ========================= */
 function ymdFromUnixMs(ms) {
   const d = new Date(ms);
@@ -133,7 +131,6 @@ function extractJsVar(js, varName) {
 function toJsonLikeArray(raw) {
   let s = raw.trim();
   if (!s.startsWith("[")) return null;
-  // 把 {x:1,y:2} -> {"x":1,"y":2}
   s = s.replace(/([{,]\s*)([a-zA-Z_]\w*)\s*:/g, '$1"$2":');
   return s;
 }
@@ -183,7 +180,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
     `&pageIndex=1&pageSize=1&callback=cb&_=${Date.now()}`;
 
   try {
-    // 1) fundgz：估值
+    // fundgz（估值）
     let gz = null;
     let gzName = null,
       gzNavDate = null,
@@ -206,7 +203,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
       }
     }
 
-    // 2) lsjz：官方净值
+    // lsjz（官方净值）
     let emNavDate = null,
       emNav = null;
     const ls = await fetchWithTimeout(lsjzUrl, { timeoutMs: 15000 });
@@ -224,7 +221,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
       }
     }
 
-    // 3) 选择更晚的净值
+    // 选更晚净值
     let navDate = null;
     let nav = null;
     let navSource = null;
@@ -244,7 +241,7 @@ app.get("/api/cn/fund/:code", async (req, res) => {
 
     let name = gzName || null;
 
-    // 4) 兜底：补 name/nav
+    // 兜底：补 name/nav
     let pzUsed = false;
     if (!name || typeof nav !== "number") {
       const pz = await fetchCnFundPingzhongdata(code);
@@ -270,12 +267,6 @@ app.get("/api/cn/fund/:code", async (req, res) => {
       estPct: typeof gzEstPct === "number" ? gzEstPct : null,
       time: gzTime,
       navSource,
-      note:
-        navSource === "eastmoney_lsjz"
-          ? "official nav updated from eastmoney"
-          : navSource === "eastmoney_pingzhongdata"
-          ? "nav filled from pingzhongdata fallback"
-          : null,
       debug: {
         build: BUILD_ID,
         fundgz_ok: !!gz,
@@ -290,9 +281,9 @@ app.get("/api/cn/fund/:code", async (req, res) => {
 });
 
 /* =========================
-   国内基金：历史净值（lsjz -> pingzhongdata兜底）
+   国内基金：历史净值（lsjz -> pingzhongdata 兜底）
 ========================= */
-async function fetchCnFundHistory(code, count = 120) {
+async function fetchCnFundHistory(code, count = 160) {
   const url =
     `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}` +
     `&pageIndex=1&pageSize=${Math.min(200, Math.max(30, count))}&callback=cb&_=${Date.now()}`;
@@ -307,8 +298,7 @@ async function fetchCnFundHistory(code, count = 120) {
         const series = list
           .map((x) => ({ date: x.FSRQ, close: safeNum(x.DWJZ) }))
           .filter((x) => x.date && typeof x.close === "number")
-          .reverse(); // old->new
-
+          .reverse();
         if (series.length) return { ok: true, series, source: "eastmoney_lsjz" };
       } catch {}
     }
@@ -321,8 +311,7 @@ async function fetchCnFundHistory(code, count = 120) {
 }
 
 /* =========================
-   stooq：历史日线（海外/板块）
-   ✅ 这段是完整函数体，保证不会出现 Illegal return
+   stooq：CSV 解析
 ========================= */
 function ensureStooqSymbol(sym) {
   const s = String(sym || "").trim().toLowerCase();
@@ -339,16 +328,18 @@ function parseCsvLines(csv) {
     const parts = lines[i].split(",");
     if (parts.length < 6) continue;
     const date = parts[0];
-    const close = safeNum(parts[4]); // Close
+    const close = safeNum(parts[4]);
     if (!date || typeof close !== "number") continue;
     out.push({ date, close });
   }
-  return out; // old -> new
+  return out; // old->new
 }
 
-async function fetchStooqHistory(symbol, count = 200) {
+/* =========================
+   stooq：主源（com + pl）+ debug
+========================= */
+async function fetchStooqHistory(symbol, count = 220) {
   const s = ensureStooqSymbol(symbol);
-
   const urls = [
     `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`,
     `https://stooq.pl/q/d/l/?s=${encodeURIComponent(s)}&i=d`,
@@ -369,6 +360,7 @@ async function fetchStooqHistory(symbol, count = 200) {
     const head = text.slice(0, 200);
     const textLen = text.length;
 
+    // 不是 CSV（HTML/限流文字）
     if (/^\s*</.test(text) || /<html/i.test(text) || /Too Many Requests/i.test(text)) {
       lastDbg = { url, status: r.status, textLen, head, kind: "non-csv(html/ratelimit)" };
       continue;
@@ -376,14 +368,108 @@ async function fetchStooqHistory(symbol, count = 200) {
 
     const rows = parseCsvLines(text);
     if (!rows.length) {
+      // 注意：stooq 会返回一行“限流文字”，这种情况下 rows 会是 0
       lastDbg = { url, status: r.status, textLen, head, kind: "empty-csv" };
       continue;
     }
 
-    return { ok: true, series: rows.slice(-count), stooqSymbol: s, usedUrl: url };
+    return { ok: true, series: rows.slice(-count), source: "stooq", usedUrl: url, stooqSymbol: s };
   }
 
-  return { ok: false, reason: "empty csv", debug: lastDbg };
+  return { ok: false, reason: "empty csv", debug: lastDbg, source: "stooq" };
+}
+
+/* =========================
+   Alpha Vantage 备用源（你已配置 ALPHAVANTAGE_KEY）
+   + 缓存（避免免费额度打爆）
+========================= */
+const AV_KEY = process.env.ALPHAVANTAGE_KEY || "";
+const marketCache = new Map(); // key -> {ts, data}
+function cacheGet(key, ttlMs) {
+  const it = marketCache.get(key);
+  if (!it) return null;
+  if (Date.now() - it.ts > ttlMs) return null;
+  return it.data;
+}
+function cacheSet(key, data) {
+  marketCache.set(key, { ts: Date.now(), data });
+}
+
+async function fetchAlphaVantageDaily(symbol, count = 220) {
+  const sym = String(symbol || "").trim().toUpperCase();
+  if (!sym) return { ok: false, reason: "symbol required" };
+  if (!AV_KEY) return { ok: false, reason: "no alphavantage key" };
+
+  const cacheKey = `av:${sym}`;
+  const cached = cacheGet(cacheKey, 6 * 60 * 60 * 1000); // 6小时
+  if (cached) return cached;
+
+  const url =
+    `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED` +
+    `&symbol=${encodeURIComponent(sym)}&outputsize=full&apikey=${encodeURIComponent(AV_KEY)}`;
+
+  const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+  if (!r.ok) {
+    const data = { ok: false, reason: `alphavantage status=${r.status}` };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+
+  try {
+    const j = JSON.parse(r.text);
+
+    // 免费版触发频率限制会给 Note
+    if (j.Note || j["Error Message"]) {
+      const data = { ok: false, reason: "alphavantage limited/error", detail: j.Note || j["Error Message"] };
+      cacheSet(cacheKey, data);
+      return data;
+    }
+
+    const ts = j["Time Series (Daily)"];
+    if (!ts || typeof ts !== "object") {
+      const data = { ok: false, reason: "alphavantage missing timeseries" };
+      cacheSet(cacheKey, data);
+      return data;
+    }
+
+    const dates = Object.keys(ts).sort(); // old->new
+    const series = [];
+    for (const d of dates) {
+      const row = ts[d];
+      const close = safeNum(row?.["5. adjusted close"] ?? row?.["4. close"]);
+      if (typeof close === "number") series.push({ date: d, close });
+    }
+
+    const data = series.length
+      ? { ok: true, series: series.slice(-count), source: "alphavantage" }
+      : { ok: false, reason: "alphavantage empty" };
+
+    cacheSet(cacheKey, data);
+    return data;
+  } catch (e) {
+    const data = { ok: false, reason: `alphavantage parse failed: ${String(e)}` };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+}
+
+/* =========================
+   市场历史：stooq -> AlphaVantage 自动兜底
+========================= */
+async function fetchMarketHistory(symbol, count = 220) {
+  // 1) stooq
+  const s = await fetchStooqHistory(symbol, count);
+  if (s.ok) return { ok: true, series: s.series, source: "stooq", usedUrl: s.usedUrl };
+
+  // 2) AlphaVantage（缓存）
+  const av = await fetchAlphaVantageDaily(symbol, count);
+  if (av.ok) return { ok: true, series: av.series, source: "alphavantage" };
+
+  return {
+    ok: false,
+    reason: `stooq failed (${s.reason}); alphavantage failed (${av.reason})`,
+    debug: { stooq: s.debug || null, alphavantage: av.detail || null, build: BUILD_ID },
+  };
 }
 
 /* =========================
@@ -480,59 +566,35 @@ app.get("/api/tech/cnfund/:code", async (req, res) => {
   const code = normFundCode(req.params.code);
   if (!code) return res.status(400).json({ ok: false, error: "fund code must be digits (<=6)" });
 
-  const hist = await fetchCnFundHistory(code, 120);
+  const hist = await fetchCnFundHistory(code, 180);
   if (!hist.ok) return res.json({ ok: false, code, reason: hist.reason || "history fetch failed", count: 0 });
 
   const ind = calcIndicatorsFromSeries(hist.series);
   if (ind.count < 60) return res.json({ ok: false, code, reason: "insufficient history", count: ind.count });
 
-  res.json({ ok: true, code, historySource: hist.source || null, ...ind });
+  res.json({ ok: true, code, historySource: hist.source || null, ...ind, build: BUILD_ID });
 });
 
 /* =========================
-   技术指标：stooq（海外）
-   ✅ 如果 stooq 在 Render 上回空，这里会带 debug
+   技术指标：海外（stooq -> alphavantage）
 ========================= */
 app.get("/api/tech/stooq/:symbol", async (req, res) => {
   const symbol = String(req.params.symbol || "").trim();
   if (!symbol) return res.status(400).json({ ok: false, error: "symbol required" });
 
-  const hist = await fetchStooqHistory(symbol, 200);
+  const hist = await fetchMarketHistory(symbol, 240);
   if (!hist.ok) {
-    return res.json({
-      ok: false,
-      symbol,
-      reason: hist.reason || "history fetch failed",
-      count: 0,
-      debug: hist.debug || null,
-      build: BUILD_ID,
-    });
+    return res.json({ ok: false, symbol, reason: hist.reason, count: 0, debug: hist.debug || null, build: BUILD_ID });
   }
 
   const ind = calcIndicatorsFromSeries(hist.series);
-  if (ind.count < 60) {
-    return res.json({
-      ok: false,
-      symbol,
-      reason: "insufficient history",
-      count: ind.count,
-      debug: { usedUrl: hist.usedUrl, stooqSymbol: hist.stooqSymbol },
-      build: BUILD_ID,
-    });
-  }
+  if (ind.count < 60) return res.json({ ok: false, symbol, reason: "insufficient history", count: ind.count, build: BUILD_ID });
 
-  res.json({
-    ok: true,
-    symbol,
-    usedUrl: hist.usedUrl,
-    stooqSymbol: hist.stooqSymbol,
-    ...ind,
-    build: BUILD_ID,
-  });
+  res.json({ ok: true, symbol, source: hist.source, usedUrl: hist.usedUrl || null, ...ind, build: BUILD_ID });
 });
 
 /* =========================
-   技术指标：批量（前端每只持仓）
+   技术指标：批量（给前端持仓）
 ========================= */
 app.post("/api/tech/batch", async (req, res) => {
   const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
@@ -550,26 +612,27 @@ app.post("/api/tech/batch", async (req, res) => {
         out.push({ ok: false, type, code: codeRaw, name, reason: "invalid fund code", count: 0 });
         continue;
       }
-      const hist = await fetchCnFundHistory(code, 160);
+      const hist = await fetchCnFundHistory(code, 180);
       if (!hist.ok) {
         out.push({ ok: false, type, code, name, reason: hist.reason || "history fetch failed", count: 0 });
         continue;
       }
       const ind = calcIndicatorsFromSeries(hist.series);
       if (ind.count < 60) out.push({ ok: false, type, code, name, reason: "insufficient history", count: ind.count });
-      else out.push({ ok: true, type, code, name, historySource: hist.source || null, ...ind });
+      else out.push({ ok: true, type, code, name, source: hist.source || null, ...ind });
       continue;
     }
 
-    if (type === "US_TICKER") {
-      const hist = await fetchStooqHistory(codeRaw, 240);
+    // 海外 ticker（用市场兜底逻辑）
+    if (type === "US_TICKER" || type === "SECTOR_ETF") {
+      const hist = await fetchMarketHistory(codeRaw, 240);
       if (!hist.ok) {
-        out.push({ ok: false, type, code: codeRaw, name, reason: hist.reason || "history fetch failed", count: 0, debug: hist.debug || null });
+        out.push({ ok: false, type, code: codeRaw, name, reason: hist.reason, count: 0 });
         continue;
       }
       const ind = calcIndicatorsFromSeries(hist.series);
       if (ind.count < 60) out.push({ ok: false, type, code: codeRaw, name, reason: "insufficient history", count: ind.count });
-      else out.push({ ok: true, type, code: codeRaw, name, usedUrl: hist.usedUrl, ...ind });
+      else out.push({ ok: true, type, code: codeRaw, name, source: hist.source, ...ind });
       continue;
     }
 
@@ -580,39 +643,19 @@ app.post("/api/tech/batch", async (req, res) => {
 });
 
 /* =========================
-   主题识别（用于风控）
+   主题识别（风控用）
 ========================= */
 const THEME_RULES = [
   {
     theme: "港股科技",
-    tokens: [
-      "恒生科技",
-      "恒科",
-      "港股科技",
-      "港股互联网",
-      "港股通",
-      "中国科技",
-      "中国互联网",
-      "中概互联",
-      "互联网",
-      "腾讯",
-      "阿里",
-      "美团",
-      "京东",
-      "快手",
-      "BABA",
-      "TCEHY",
-    ],
+    tokens: ["恒生科技", "恒科", "港股科技", "港股互联网", "港股通", "中国科技", "中国互联网", "中概互联", "互联网", "腾讯", "阿里", "美团", "京东", "快手"],
   },
-  {
-    theme: "全球成长&美股",
-    tokens: ["全球", "QDII", "全球成长", "全球精选", "纳指", "NASDAQ", "美股", "美国", "标普", "S&P", "SPY", "QQQ"],
-  },
-  { theme: "日本", tokens: ["日本", "日经", "日元", "BOJ", "日本央行"] },
+  { theme: "全球成长&美股", tokens: ["全球", "QDII", "全球成长", "全球精选", "纳指", "NASDAQ", "美股", "美国", "标普", "S&P", "SPY", "QQQ"] },
+  { theme: "日本", tokens: ["日本", "日经", "日本精选", "日元"] },
   { theme: "越南/东南亚", tokens: ["越南", "东南亚"] },
   { theme: "黄金/贵金属", tokens: ["黄金", "金价", "白银", "贵金属"] },
   { theme: "新能源", tokens: ["新能源", "光伏", "储能", "锂电", "电池", "风电", "电动车"] },
-  { theme: "医药", tokens: ["医药", "创新药", "医疗", "医保", "生物科技", "CXO", "集采"] },
+  { theme: "医药", tokens: ["医药", "创新药", "医疗", "生物科技", "CXO", "集采"] },
   { theme: "军工", tokens: ["军工", "国防", "航空", "航天"] },
   { theme: "煤炭", tokens: ["煤炭"] },
   { theme: "印度", tokens: ["印度"] },
@@ -656,17 +699,12 @@ app.post("/api/risk/check", (req, res) => {
     const text = `${p.name || ""} ${p.code || ""}`;
     const themes = detectThemesFromText(text);
     const w = wBase[i] / sumW;
-    if (!themes.length) {
-      themeMap["未识别"] = (themeMap["未识别"] || 0) + w;
-    } else {
-      for (const t of themes) themeMap[t] = (themeMap[t] || 0) + w;
-    }
+    if (!themes.length) themeMap["未识别"] = (themeMap["未识别"] || 0) + w;
+    else for (const t of themes) themeMap[t] = (themeMap[t] || 0) + w;
   }
 
   const themePairs = Object.entries(themeMap).sort((a, b) => b[1] - a[1]);
-  const topTheme = themePairs[0]
-    ? { theme: themePairs[0][0], weight: themePairs[0][1] }
-    : { theme: "未识别", weight: 1 };
+  const topTheme = themePairs[0] ? { theme: themePairs[0][0], weight: themePairs[0][1] } : { theme: "未识别", weight: 1 };
 
   let riskLevel = "低";
   if (maxPosW >= 0.45 || topTheme.weight >= 0.65) riskLevel = "高";
@@ -677,7 +715,7 @@ app.post("/api/risk/check", (req, res) => {
   const issues = [];
   if (maxPosW >= 0.45) issues.push({ level: "高", text: `单一持仓占比 ${(maxPosW * 100).toFixed(1)}% 过高：${maxPos?.code || ""}` });
   if (topTheme.weight >= 0.65) issues.push({ level: "高", text: `主题「${topTheme.theme}」集中度 ${(topTheme.weight * 100).toFixed(1)}% 过高` });
-  if (!issues.length) issues.push({ level: "低", text: "暂无明显风控红灯（此模块仅做结构性提示）" });
+  if (!issues.length) issues.push({ level: "低", text: "暂无明显风控红灯（仅结构性提示）" });
 
   res.json({
     ok: true,
@@ -693,8 +731,7 @@ app.post("/api/risk/check", (req, res) => {
 });
 
 /* =========================
-   板块动向：扫描（目前仍依赖 stooq）
-   说明：如果 Render 对 stooq 限制，这里会空
+   板块动向：扫描（stooq -> alphavantage）
 ========================= */
 function scoreSector(ind) {
   let s = 0;
@@ -722,23 +759,26 @@ app.post("/api/sector/scan", async (req, res) => {
   const out = [];
   const debug = [];
 
-  for (const it of items.slice(0, 80)) {
+  // 免费 key 避免被打爆：限制一次最多 20 个
+  const MAX = 20;
+
+  for (const it of items.slice(0, MAX)) {
     const theme = it.theme || "未分类";
     const symbol = String(it.symbol || "").trim();
     const name = it.name || null;
     if (!symbol) continue;
 
-    const hist = await fetchStooqHistory(symbol, 220);
+    const hist = await fetchMarketHistory(symbol, 240);
     if (!hist.ok) {
       out.push({ theme, symbol, name, ok: false, reason: hist.reason || "history fetch failed", count: 0 });
-      debug.push({ symbol, stooq: hist.debug || null });
+      debug.push({ symbol, debug: hist.debug || null });
       continue;
     }
 
     const ind = calcIndicatorsFromSeries(hist.series);
     if (ind.count < 60) {
       out.push({ theme, symbol, name, ok: false, reason: "insufficient history", count: ind.count });
-      debug.push({ symbol, stooq: { ok: true, count: ind.count, usedUrl: hist.usedUrl } });
+      debug.push({ symbol, source: hist.source, count: ind.count });
       continue;
     }
 
@@ -747,7 +787,7 @@ app.post("/api/sector/scan", async (req, res) => {
       symbol,
       name,
       ok: true,
-      usedUrl: hist.usedUrl,
+      source: hist.source,
       count: ind.count,
       last: ind.last,
       sma20: ind.sma20,
@@ -758,7 +798,7 @@ app.post("/api/sector/scan", async (req, res) => {
       hist: ind.hist,
       score: scoreSector(ind),
     });
-    debug.push({ symbol, ok: true, usedUrl: hist.usedUrl });
+    debug.push({ symbol, source: hist.source });
   }
 
   const okOnes = out.filter((x) => x.ok);
