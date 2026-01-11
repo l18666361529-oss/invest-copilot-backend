@@ -373,31 +373,40 @@ async function fetchStooqHistory(symbol, count = 160) {
 
   const urls = [
     `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`,
-    `https://stooq.pl/q/d/l/?s=${encodeURIComponent(s)}&i=d`, // 备用域名
+    `https://stooq.pl/q/d/l/?s=${encodeURIComponent(s)}&i=d`,
   ];
 
   let lastDbg = null;
 
   for (const url of urls) {
-    const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
+    let r;
+    try {
+      r = await fetchWithTimeout(url, { timeoutMs: 15000 });
+    } catch (e) {
+      lastDbg = { url, kind: "fetch-throw", error: String(e) };
+      continue;
+    }
+
     const text = r.text || "";
     const head = text.slice(0, 200);
     const textLen = text.length;
 
-    // 如果被拦，一般会返回 HTML / 限流提示
+    // 先记录 debug（无论成功失败都能看到）
+    lastDbg = { url, status: r.status, textLen, head };
+
+    // 被拦/HTML/限流
     if (/^\s*</.test(text) || /<html/i.test(text) || /Too Many Requests/i.test(text)) {
-      lastDbg = { url, status: r.status, textLen, head, kind: "non-csv(html/ratelimit)" };
+      lastDbg.kind = "non-csv(html/ratelimit)";
       continue;
     }
 
     const rows = parseCsvLines(text);
     if (!rows.length) {
-      // 常见：只返回表头/空内容
-      lastDbg = { url, status: r.status, textLen, head, kind: "empty-csv" };
+      lastDbg.kind = "empty-csv";
       continue;
     }
 
-    return { ok: true, series: rows.slice(-count), stooqSymbol: s, usedUrl: url };
+    return { ok: true, series: rows.slice(-count), stooqSymbol: s, usedUrl: url, debug: lastDbg };
   }
 
   return { ok: false, reason: "empty csv", debug: lastDbg };
