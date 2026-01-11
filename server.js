@@ -338,6 +338,52 @@ async function fetchEastmoneyFundHistory(code, days = 260) {
    stooq 日线历史（雷达/技术指标用）
    增强：UA + 重试
 ========================= */
+async function fetchYahooChartHistory(symbol, days = 260) {
+  const range = "1y";
+  const interval = "1d";
+  const sym = symbol.toUpperCase();
+
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=${range}&interval=${interval}`;
+
+  const r = await fetchWithTimeout(url, {
+    timeoutMs: 22000,
+    retries: 1,
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+      "Accept": "application/json,text/plain,*/*",
+      "Accept-Language": "en-US,en;q=0.9"
+    }
+  });
+
+  if (!r.ok) return { series: [], debug: { ok: false, status: r.status, where: "yahoo" } };
+
+  let j;
+  try { j = JSON.parse(r.text); } catch {
+    return { series: [], debug: { ok: false, where: "yahoo", parse: "fail" } };
+  }
+
+  const result = j?.chart?.result?.[0];
+  const ts = result?.timestamp || [];
+  const close = result?.indicators?.quote?.[0]?.close || [];
+
+  if (!Array.isArray(ts) || !Array.isArray(close) || ts.length < 10) {
+    return { series: [], debug: { ok: true, where: "yahoo", empty: true } };
+  }
+
+  const series = [];
+  for (let i = 0; i < ts.length; i++) {
+    const c = safeNum(close[i]);
+    if (typeof c !== "number") continue;
+    const d = new Date(ts[i] * 1000);
+    const date = `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;
+    series.push({ date, close: c });
+  }
+
+  const want = Math.min(520, Math.max(60, Number(days || 260)));
+  return { series: series.slice(Math.max(0, series.length - want)), debug: { ok: true, where: "yahoo", rows: series.length } };
+}
+
 async function fetchStooqHistory(symbol, days = 260) {
   const want = Math.min(520, Math.max(60, Number(days || 260)));
   const sym = symbol.includes(".") ? symbol : `${symbol}.us`;
@@ -349,13 +395,27 @@ async function fetchStooqHistory(symbol, days = 260) {
     headers: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-      "Accept": "text/csv,*/*"
+      "Accept": "text/csv,*/*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Referer": "https://stooq.com/"
     }
   });
-  if (!r.ok) return { series: [], debug: { status: r.status, ok: false } };
 
-  const lines = String(r.text || "").trim().split("\n");
-  if (lines.length < 2) return { series: [], debug: { ok: true, empty: true } };
+  if (!r.ok) {
+    const y = await fetchYahooChartHistory(symbol, want);
+    return { ...y, debug: { ...(y.debug || {}), stooq: { ok: false, status: r.status }, usedFallback: true } };
+  }
+
+  const text = String(r.text || "").trim();
+  const lines = text.split("\n");
+
+  if (lines.length < 2 || /no data/i.test(text)) {
+    const y = await fetchYahooChartHistory(symbol, want);
+    return {
+      ...y,
+      debug: { ...(y.debug || {}), stooq: { ok: true, empty: true }, usedFallback: true }
+    };
+  }
 
   const series = [];
   for (let i = 1; i < lines.length; i++) {
@@ -365,7 +425,13 @@ async function fetchStooqHistory(symbol, days = 260) {
     const close = safeNum(p[4]);
     if (date && typeof close === "number") series.push({ date, close });
   }
-  return { series: series.slice(Math.max(0, series.length - want)), debug: { ok: true, rows: series.length } };
+
+  if (series.length < 10) {
+    const y = await fetchYahooChartHistory(symbol, want);
+    return { ...y, debug: { ...(y.debug || {}), stooq: { ok: true, parsedRows: series.length }, usedFallback: true } };
+  }
+
+  return { series: series.slice(Math.max(0, series.length - want)), debug: { ok: true, where: "stooq", rows: series.length, usedFallback: false } };
 }
 
 /* =========================
