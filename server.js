@@ -5,629 +5,404 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-/* =========================
-   Build / Health
-========================= */
+const PORT = process.env.PORT || 3000;
 const BUILD_ID = new Date().toISOString();
-app.get("/health", (_req, res) => res.json({ ok: true, build: BUILD_ID }));
+
+const TZ = process.env.TZ || "Asia/Shanghai";
+const AV_KEY = process.env.ALPHAVANTAGE_KEY || "";
 
 /* =========================
-   Utils
+   Simple in-memory cache
 ========================= */
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36";
+const _cache = new Map();
+function cacheGet(key, ttlMs) {
+  const v = _cache.get(key);
+  if (!v) return null;
+  if (Date.now() - v.ts > ttlMs) return null;
+  return v.data;
+}
+function cacheSet(key, data) {
+  _cache.set(key, { ts: Date.now(), data });
+}
 
 function safeNum(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
 }
-
-function toYmd(d) {
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+function normFundCode(code) {
+  const s = String(code || "").trim();
+  if (!s) return null;
+  if (/^\d{1,6}$/.test(s)) return s.padStart(6, "0");
+  return null;
 }
 
-function ymdFromUnixMs(ms) {
-  const d = new Date(ms);
-  if (!Number.isFinite(d.getTime())) return null;
-  return toYmd(d);
-}
-
-function normFundCode(codeRaw) {
-  const s = String(codeRaw || "").trim();
-  if (!/^\d{1,6}$/.test(s)) return null;
-  return s.padStart(6, "0");
-}
-
-function headersForUrl(url, headers = {}) {
-  const base = { "User-Agent": UA, Accept: "*/*" };
-  const h = { ...base, ...(headers || {}) };
-  try {
-    const u = new URL(url);
-    const host = u.hostname;
-    if (host.includes("eastmoney.com")) {
-      h.Referer ||= "https://fund.eastmoney.com/";
-      h.Origin ||= "https://fund.eastmoney.com";
-    }
-    if (host.includes("fundgz.1234567.com.cn")) {
-      h.Referer ||= "https://fund.eastmoney.com/";
-    }
-    if (host.includes("stooq.com") || host.includes("stooq.pl")) {
-      h.Referer ||= "https://stooq.com/";
-    }
-    if (host.includes("alphavantage.co")) {
-      h.Referer ||= "https://www.alphavantage.co/";
-      h.Accept ||= "application/json";
-    }
-  } catch {}
-  return h;
-}
-
-async function fetchWithTimeout(
-  url,
-  { method = "GET", headers = {}, body = undefined, timeoutMs = 15000 } = {}
-) {
+async function fetchWithTimeout(url, { timeoutMs = 20000, headers = {} } = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const resp = await fetch(url, {
-      method,
-      headers: headersForUrl(url, headers),
-      body,
-      signal: ctrl.signal,
-    });
-    const text = await resp.text();
-    return { ok: resp.ok, status: resp.status, text };
+    const r = await fetch(url, { headers, signal: ctrl.signal });
+    const text = await r.text();
+    return { ok: r.ok, status: r.status, text };
   } finally {
     clearTimeout(t);
   }
 }
 
 /* =========================
-   pingzhongdata (name + long history)
+   CSV parser for Stooq
 ========================= */
-function extractJsVar(js, varName) {
-  const re = new RegExp(`var\\s+${varName}\\s*=\\s*`, "m");
-  const m = js.match(re);
-  if (!m) return null;
-  const idx = js.indexOf(m[0]) + m[0].length;
-  const rest = js.slice(idx);
-  const end = rest.indexOf(";");
-  if (end < 0) return null;
-  return rest.slice(0, end).trim();
-}
-
-function toJsonLikeArray(raw) {
-  let s = raw.trim();
-  if (!s.startsWith("[")) return null;
-  // {x:1,y:2} -> {"x":1,"y":2}
-  s = s.replace(/([{,]\s*)([a-zA-Z_]\w*)\s*:/g, '$1"$2":');
-  return s;
-}
-
-async function fetchCnFundPingzhongdata(code) {
-  const url = `https://fund.eastmoney.com/pingzhongdata/${code}.js?v=${Date.now()}`;
-  const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
-  if (!r.ok) return { ok: false, reason: `pingzhongdata status=${r.status}` };
-
-  let name = null;
-  const nameRaw = extractJsVar(r.text, "fS_name");
-  if (nameRaw && /^".*"$/.test(nameRaw)) name = nameRaw.slice(1, -1);
-
-  const raw = extractJsVar(r.text, "Data_netWorthTrend");
-  if (!raw) return { ok: false, reason: "pingzhongdata missing Data_netWorthTrend", name };
-
-  const jsonLike = toJsonLikeArray(raw);
-  if (!jsonLike) return { ok: false, reason: "pingzhongdata parse precheck failed", name };
-
-  try {
-    const arr = JSON.parse(jsonLike);
-    const series = (arr || [])
-      .map((it) => {
-        const date = it?.x != null ? ymdFromUnixMs(Number(it.x)) : null;
-        const close = safeNum(it?.y);
-        return { date, close };
-      })
-      .filter((x) => x.date && typeof x.close === "number");
-
-    if (!series.length) return { ok: false, reason: "pingzhongdata empty history", name };
-    return { ok: true, name, series };
-  } catch (e) {
-    return { ok: false, reason: `pingzhongdata JSON.parse failed: ${String(e)}`, name };
-  }
-}
-
-/* =========================
-   CN fund: fundgz + lsjz + pingzhongdata fallback
-========================= */
-app.get("/api/cn/fund/:code", async (req, res) => {
-  const code = normFundCode(req.params.code);
-  if (!code) return res.status(400).json({ ok: false, error: "fund code must be digits (<=6)" });
-
-  const fundgzUrl = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
-  const lsjzUrl =
-    `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}` +
-    `&pageIndex=1&pageSize=1&callback=cb&_=${Date.now()}`;
-
-  try {
-    // fundgz
-    let gz = null;
-    let gzName = null,
-      gzNavDate = null,
-      gzNav = null,
-      gzEstNav = null,
-      gzEstPct = null,
-      gzTime = null;
-
-    const gzResp = await fetchWithTimeout(fundgzUrl, { timeoutMs: 15000 });
-    if (gzResp.ok) {
-      const m = gzResp.text.match(/jsonpgz\((\{.*\})\);?/);
-      if (m) {
-        gz = JSON.parse(m[1]);
-        gzName = gz.name || null;
-        gzNavDate = gz.jzrq || null;
-        gzNav = safeNum(gz.dwjz);
-        gzEstNav = safeNum(gz.gsz);
-        gzEstPct = safeNum(gz.gszzl);
-        gzTime = gz.gztime || null;
-      }
-    }
-
-    // lsjz official nav
-    let emNavDate = null,
-      emNav = null;
-    const ls = await fetchWithTimeout(lsjzUrl, { timeoutMs: 15000 });
-    if (ls.ok) {
-      const mm = ls.text.match(/cb\((\{.*\})\)/);
-      if (mm) {
-        try {
-          const j = JSON.parse(mm[1]);
-          const row = j?.Data?.LSJZList?.[0];
-          if (row) {
-            emNavDate = row.FSRQ || null;
-            emNav = safeNum(row.DWJZ);
-          }
-        } catch {}
-      }
-    }
-
-    // pick later nav
-    let navDate = null;
-    let nav = null;
-    let navSource = null;
-
-    const a = gzNavDate ? Number(String(gzNavDate).replaceAll("-", "")) : null;
-    const b = emNavDate ? Number(String(emNavDate).replaceAll("-", "")) : null;
-
-    if (typeof emNav === "number" && b && (!a || b >= a)) {
-      navDate = emNavDate;
-      nav = emNav;
-      navSource = "eastmoney_lsjz";
-    } else if (typeof gzNav === "number") {
-      navDate = gzNavDate;
-      nav = gzNav;
-      navSource = "fundgz";
-    }
-
-    let name = gzName || null;
-
-    // fallback: pingzhongdata for name / nav
-    let pzUsed = false;
-    if (!name || typeof nav !== "number") {
-      const pz = await fetchCnFundPingzhongdata(code);
-      if (pz.ok) {
-        pzUsed = true;
-        name = name || pz.name || null;
-        if (typeof nav !== "number") {
-          const last = pz.series[pz.series.length - 1];
-          nav = last.close;
-          navDate = last.date;
-          navSource = "eastmoney_pingzhongdata";
-        }
-      }
-    }
-
-    res.json({
-      ok: true,
-      source: "cn_fund_dual",
-      code,
-      name,
-      navDate,
-      nav,
-      estNav: typeof gzEstNav === "number" ? gzEstNav : null,
-      estPct: typeof gzEstPct === "number" ? gzEstPct : null,
-      time: gzTime,
-      navSource,
-      debug: {
-        build: BUILD_ID,
-        fundgz_ok: !!gz,
-        fundgz_navDate: gzNavDate,
-        eastmoney_navDate: emNavDate,
-        pingzhongdata_used: pzUsed,
-      },
-    });
-  } catch (e) {
-    res.status(502).json({ ok: false, error: "cn fund upstream error", detail: String(e) });
-  }
-});
-
-/* =========================
-   CN fund history: lsjz -> pingzhongdata fallback (关键：不足60条就用 pingzhongdata)
-========================= */
-async function fetchCnFundHistory(code, count = 180) {
-  const url =
-    `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}` +
-    `&pageIndex=1&pageSize=${Math.min(200, Math.max(30, count))}&callback=cb&_=${Date.now()}`;
-
-  const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
-
-  if (r.ok) {
-    const mm = r.text.match(/cb\((\{.*\})\)/);
-    if (mm) {
-      try {
-        const j = JSON.parse(mm[1]);
-        const list = j?.Data?.LSJZList || [];
-        const series = list
-          .map((x) => ({ date: x.FSRQ, close: safeNum(x.DWJZ) }))
-          .filter((x) => x.date && typeof x.close === "number")
-          .reverse(); // old->new
-
-        // ✅ 关键：lsjz 有时只返回 20 条；不足 60 条就不要用它，改用 pingzhongdata
-        if (series.length >= 60) return { ok: true, series, source: "eastmoney_lsjz" };
-      } catch {}
-    }
-  }
-
-  const pz = await fetchCnFundPingzhongdata(code);
-  if (pz.ok) return { ok: true, series: pz.series.slice(-count), source: "eastmoney_pingzhongdata" };
-
-  return { ok: false, reason: r.ok ? "empty history" : `eastmoney status=${r.status}` };
-}
-
-/* =========================
-   stooq history
-========================= */
-function ensureStooqSymbol(sym) {
-  const s = String(sym || "").trim().toLowerCase();
-  if (!s) return "";
-  if (s.includes(".")) return s;
-  return `${s}.us`;
-}
-
-function parseCsvLines(csv) {
-  const lines = String(csv || "").trim().split("\n").filter(Boolean);
-  if (lines.length < 2) return [];
+function parseStooqCsv(csvText) {
+  const lines = String(csvText || "").trim().split("\n").filter(Boolean);
+  if (lines.length < 3) return [];
+  // header: Date,Open,High,Low,Close,Volume
   const out = [];
   for (let i = 1; i < lines.length; i++) {
     const parts = lines[i].split(",");
-    if (parts.length < 6) continue;
+    if (parts.length < 5) continue;
     const date = parts[0];
     const close = safeNum(parts[4]);
-    if (!date || typeof close !== "number") continue;
-    out.push({ date, close });
+    if (date && typeof close === "number") out.push({ date, close });
   }
   return out;
-}
-
-async function fetchStooqHistory(symbol, count = 120) {
-  const s = ensureStooqSymbol(symbol);
-  const urls = [
-    `https://stooq.com/q/d/l/?s=${encodeURIComponent(s)}&i=d`,
-    `https://stooq.pl/q/d/l/?s=${encodeURIComponent(s)}&i=d`,
-  ];
-
-  let lastDbg = null;
-
-  for (const url of urls) {
-    let r;
-    try {
-      r = await fetchWithTimeout(url, { timeoutMs: 15000 });
-    } catch (e) {
-      lastDbg = { url, kind: "fetch-throw", error: String(e) };
-      continue;
-    }
-
-    const text = r.text || "";
-    const head = text.slice(0, 200);
-    const textLen = text.length;
-
-    if (/Przekroczony dzienny limit/i.test(text)) {
-      lastDbg = { url, status: r.status, textLen, head, kind: "daily-limit" };
-      continue;
-    }
-
-    if (/^\s*</.test(text) || /<html/i.test(text) || /Too Many Requests/i.test(text)) {
-      lastDbg = { url, status: r.status, textLen, head, kind: "non-csv(html/ratelimit)" };
-      continue;
-    }
-
-    const rows = parseCsvLines(text);
-    if (!rows.length) {
-      lastDbg = { url, status: r.status, textLen, head, kind: "empty-csv" };
-      continue;
-    }
-
-    return { ok: true, series: rows.slice(-count), source: "stooq", usedUrl: url, stooqSymbol: s };
-  }
-
-  return { ok: false, reason: "empty csv", debug: lastDbg, source: "stooq" };
-}
-
-/* =========================
-   Alpha Vantage fallback (FREE): TIME_SERIES_DAILY + outputsize=compact
-========================= */
-const AV_KEY = process.env.ALPHAVANTAGE_KEY || "";
-
-// cache: success 6h, fail 2m
-const marketCache = new Map(); // key -> {ts, ttlMs, data}
-function cacheGet(key) {
-  const it = marketCache.get(key);
-  if (!it) return null;
-  if (Date.now() - it.ts > it.ttlMs) return null;
-  return it.data;
-}
-function cacheSet(key, data, ttlMs) {
-  marketCache.set(key, { ts: Date.now(), ttlMs, data });
-}
-
-async function fetchAlphaVantageDaily(symbol, count = 120) {
-  const sym = String(symbol || "").trim().toUpperCase();
-  if (!sym) return { ok: false, reason: "symbol required" };
-  if (!AV_KEY) return { ok: false, reason: "no alphavantage key" };
-
-  const cacheKey = `av:${sym}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return cached;
-
-  const url =
-    `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY` +
-    `&symbol=${encodeURIComponent(sym)}&outputsize=compact&apikey=${encodeURIComponent(AV_KEY)}`;
-
-  const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
-  const rawHead = (r.text || "").slice(0, 300);
-
-  if (!r.ok) {
-    const data = { ok: false, reason: `alphavantage status=${r.status}`, head: rawHead };
-    cacheSet(cacheKey, data, 2 * 60 * 1000);
-    return data;
-  }
-
-  try {
-    const j = JSON.parse(r.text);
-    const info = j.Note || j.Information || j["Error Message"];
-    if (info) {
-      const data = { ok: false, reason: "alphavantage limited/error", detail: info, keys: Object.keys(j), head: rawHead };
-      cacheSet(cacheKey, data, 2 * 60 * 1000);
-      return data;
-    }
-
-    const ts = j["Time Series (Daily)"];
-    if (!ts || typeof ts !== "object") {
-      const data = { ok: false, reason: "alphavantage missing timeseries", detail: { keys: Object.keys(j), head: rawHead } };
-      cacheSet(cacheKey, data, 2 * 60 * 1000);
-      return data;
-    }
-
-    const dates = Object.keys(ts).sort();
-    const series = [];
-    for (const d of dates) {
-      const row = ts[d];
-      const close = safeNum(row?.["4. close"]);
-      if (typeof close === "number") series.push({ date: d, close });
-    }
-
-    const data = series.length
-      ? { ok: true, series: series.slice(-count), source: "alphavantage" }
-      : { ok: false, reason: "alphavantage empty", detail: { head: rawHead } };
-
-    cacheSet(cacheKey, data, data.ok ? 6 * 60 * 60 * 1000 : 10 * 60 * 1000);
-    return data;
-  } catch (e) {
-    const data = { ok: false, reason: `alphavantage parse failed: ${String(e)}`, head: rawHead };
-    cacheSet(cacheKey, data, 2 * 60 * 1000);
-    return data;
-  }
-}
-
-/* =========================
-   Market history: stooq -> alphavantage
-========================= */
-async function fetchMarketHistory(symbol, count = 120) {
-  const s = await fetchStooqHistory(symbol, count);
-  if (s.ok) return { ok: true, series: s.series, source: "stooq", usedUrl: s.usedUrl };
-
-  const av = await fetchAlphaVantageDaily(symbol, count);
-  if (av.ok) return { ok: true, series: av.series, source: "alphavantage" };
-
-  return {
-    ok: false,
-    reason: `stooq failed (${s.reason}); alphavantage failed (${av.reason})`,
-    debug: { stooq: s.debug || null, alphavantage: av.detail || av.head || null, build: BUILD_ID },
-  };
 }
 
 /* =========================
    Indicators
 ========================= */
-function SMA(values, period) {
+function sma(values, period) {
   if (values.length < period) return null;
   let sum = 0;
   for (let i = values.length - period; i < values.length; i++) sum += values[i];
   return sum / period;
 }
 
-function RSI(values, period = 14) {
+function rsi14(values) {
+  const period = 14;
   if (values.length < period + 1) return null;
-  let gains = 0;
-  let losses = 0;
+  let gains = 0, losses = 0;
   for (let i = values.length - period; i < values.length; i++) {
     const diff = values[i] - values[i - 1];
     if (diff >= 0) gains += diff;
-    else losses += Math.abs(diff);
+    else losses += -diff;
   }
-  if (losses === 0 && gains === 0) return 50;
-  if (losses === 0) return 100;
-  const rs = gains / losses;
-  return 100 - 100 / (1 + rs);
+  const avgGain = gains / period;
+  const avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
 }
 
-function EMA(values, period) {
+function ema(values, period) {
   if (values.length < period) return null;
   const k = 2 / (period + 1);
-  let ema = 0;
-  for (let i = 0; i < period; i++) ema += values[i];
-  ema /= period;
-  for (let i = period; i < values.length; i++) {
-    ema = values[i] * k + ema * (1 - k);
+  let e = values[0];
+  for (let i = 1; i < values.length; i++) {
+    e = values[i] * k + e * (1 - k);
   }
-  return ema;
+  return e;
 }
 
-function MACD(values) {
-  if (values.length < 35) return null;
-  const ema12 = EMA(values.slice(-60), 12);
-  const ema26 = EMA(values.slice(-60), 26);
-  if (ema12 == null || ema26 == null) return null;
-  const macd = ema12 - ema26;
+function macd(values) {
+  // MACD(12,26,9)
+  if (values.length < 26) return { macd: null, signal: null, hist: null };
+  const ema12 = ema(values.slice(-60), 12); // use recent window
+  const ema26 = ema(values.slice(-60), 26);
+  if (ema12 == null || ema26 == null) return { macd: null, signal: null, hist: null };
+  const m = ema12 - ema26;
 
-  const tail = values.slice(-80);
+  // build macd series for signal
   const macdSeries = [];
-  for (let i = 35; i < tail.length; i++) {
-    const seg = tail.slice(0, i + 1);
-    const e12 = EMA(seg, 12);
-    const e26 = EMA(seg, 26);
-    if (e12 != null && e26 != null) macdSeries.push(e12 - e26);
+  const window = values.slice(-80);
+  let e12 = window[0], e26 = window[0];
+  const k12 = 2 / (12 + 1);
+  const k26 = 2 / (26 + 1);
+  for (let i = 1; i < window.length; i++) {
+    e12 = window[i] * k12 + e12 * (1 - k12);
+    e26 = window[i] * k26 + e26 * (1 - k26);
+    macdSeries.push(e12 - e26);
   }
-  const signal = macdSeries.length >= 10 ? EMA(macdSeries.slice(-30), 9) : null;
-  const hist = signal == null ? null : macd - signal;
-  return { macd, signal, hist };
-}
-
-function retN(values, n = 20) {
-  if (values.length < n + 1) return null;
-  const a = values[values.length - n - 1];
-  const b = values[values.length - 1];
-  if (!a || !b) return null;
-  return (b / a - 1) * 100;
+  const sig = ema(macdSeries, 9);
+  const hist = (sig == null) ? null : (m - sig);
+  return { macd: m, signal: sig, hist };
 }
 
 function calcIndicatorsFromSeries(series) {
   const closes = series.map((x) => x.close).filter((x) => typeof x === "number");
-  const last = closes.length ? closes[closes.length - 1] : null;
-  const sma20 = SMA(closes, 20);
-  const sma60 = SMA(closes, 60);
-  const rsi14 = RSI(closes, 14);
-  const m = MACD(closes);
-  const r20 = retN(closes, 20);
-
+  const count = closes.length;
+  const last = count ? closes[count - 1] : null;
+  const sma20 = sma(closes, 20);
+  const sma60 = sma(closes, 60);
+  const rsi = rsi14(closes);
+  const ret20 = count >= 21 ? ((closes[count - 1] / closes[count - 21]) - 1) * 100 : null;
+  const m = macd(closes);
   return {
-    count: closes.length,
+    count,
     last,
     sma20,
     sma60,
-    rsi14,
-    macd: m ? m.macd : null,
-    signal: m ? m.signal : null,
-    hist: m ? m.hist : null,
-    ret20: r20,
+    rsi14: rsi,
+    ret20,
+    macd: m.macd,
+    signal: m.signal,
+    hist: m.hist
+  };
+}
+
+function scoreSector(ind) {
+  // simple score: momentum + trend + rsi penalty
+  let s = 0;
+  if (typeof ind.ret20 === "number") s += ind.ret20;
+  if (typeof ind.sma20 === "number" && typeof ind.sma60 === "number") {
+    if (ind.sma20 > ind.sma60) s += 2;
+    else s -= 2;
+  }
+  if (typeof ind.rsi14 === "number") {
+    if (ind.rsi14 > 75) s -= 2;
+    if (ind.rsi14 < 30) s -= 1;
+  }
+  return s;
+}
+
+/* =========================
+   Market history (US): prefer Stooq, fallback AlphaVantage
+========================= */
+async function fetchStooqHistory(sym, count = 120) {
+  const cacheKey = `stooq:${sym}:${count}`;
+  const cached = cacheGet(cacheKey, 6 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  const symbol = sym.toLowerCase();
+  const url = `https://stooq.pl/q/d/l/?s=${encodeURIComponent(symbol)}.us&i=d`;
+  const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+  if (!r.ok) {
+    const data = { ok: false, reason: `stooq status=${r.status}` };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+
+  // stooq may rate limit by returning short text in Polish
+  const head = (r.text || "").slice(0, 60);
+  const series = parseStooqCsv(r.text);
+  if (!series.length) {
+    const data = {
+      ok: false,
+      reason: "stooq empty csv",
+      debug: { url, status: r.status, textLen: (r.text || "").length, head, kind: "empty-csv" }
+    };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+
+  const data = { ok: true, series: series.slice(-count), source: "stooq", debug: { url, status: r.status, textLen: (r.text || "").length, head } };
+  cacheSet(cacheKey, data);
+  return data;
+}
+
+async function fetchAlphaVantageHistory(sym, count = 120) {
+  const cacheKey = `av:${sym}:${count}`;
+  const cached = cacheGet(cacheKey, 6 * 60 * 60 * 1000);
+  if (cached) return cached;
+
+  if (!AV_KEY) {
+    const data = { ok: false, reason: "alphavantage missing key" };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+
+  // IMPORTANT: free AV does NOT allow outputsize=full for some endpoints; use compact to avoid premium
+  const url =
+    `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED` +
+    `&symbol=${encodeURIComponent(sym)}&outputsize=compact&apikey=${encodeURIComponent(AV_KEY)}`;
+
+  const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+  if (!r.ok) {
+    const data = { ok: false, reason: `alphavantage status=${r.status}` };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+
+  try {
+    const j = JSON.parse(r.text);
+
+    if (j.Note || j["Error Message"]) {
+      const data = { ok: false, reason: "alphavantage limited/error", detail: j.Note || j["Error Message"] };
+      cacheSet(cacheKey, data);
+      return data;
+    }
+
+    const ts = j["Time Series (Daily)"];
+    if (!ts || typeof ts !== "object") {
+      const data = { ok: false, reason: "alphavantage missing timeseries", detail: j };
+      cacheSet(cacheKey, data);
+      return data;
+    }
+
+    const dates = Object.keys(ts).sort(); // old->new
+    const series = [];
+    for (const d of dates) {
+      const row = ts[d];
+      const close = safeNum(row?.["5. adjusted close"] ?? row?.["4. close"]);
+      if (typeof close === "number") series.push({ date: d, close });
+    }
+
+    const data = series.length
+      ? { ok: true, series: series.slice(-count), source: "alphavantage" }
+      : { ok: false, reason: "alphavantage empty" };
+
+    cacheSet(cacheKey, data);
+    return data;
+  } catch (e) {
+    const data = { ok: false, reason: `alphavantage parse failed: ${String(e)}` };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+}
+
+async function fetchMarketHistory(sym, count = 120) {
+  // try stooq
+  const a = await fetchStooqHistory(sym, count);
+  if (a.ok) return a;
+
+  // fallback to AV
+  const b = await fetchAlphaVantageHistory(sym, count);
+  if (b.ok) return b;
+
+  return {
+    ok: false,
+    reason: `stooq failed (${a.reason}); alphavantage failed (${b.reason})`,
+    debug: { stooq: a.debug || a, alphavantage: b.detail || b }
   };
 }
 
 /* =========================
-   Tech: CN fund
+   CN fund history: eastmoney pingzhongdata (and/or ljsz)
 ========================= */
-app.get("/api/tech/cnfund/:code", async (req, res) => {
-  const code = normFundCode(req.params.code);
-  if (!code) return res.status(400).json({ ok: false, error: "fund code must be digits (<=6)" });
+async function fetchCnFundHistory(code, count = 180) {
+  const cacheKey = `cnfund_hist:${code}:${count}`;
+  const cached = cacheGet(cacheKey, 6 * 60 * 60 * 1000);
+  if (cached) return cached;
 
-  const hist = await fetchCnFundHistory(code, 180);
-  if (!hist.ok) return res.json({ ok: false, code, reason: hist.reason || "history fetch failed", count: 0, build: BUILD_ID });
+  const url = `https://fund.eastmoney.com/pingzhongdata/${encodeURIComponent(code)}.js?v=${Date.now()}`;
+  const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+  if (!r.ok) {
+    const data = { ok: false, reason: `eastmoney pingzhongdata status=${r.status}` };
+    cacheSet(cacheKey, data);
+    return data;
+  }
 
-  const ind = calcIndicatorsFromSeries(hist.series);
-  if (ind.count < 60) return res.json({ ok: false, code, reason: "insufficient history", count: ind.count, build: BUILD_ID });
+  const text = r.text || "";
+  // naive extract of Data_netWorthTrend
+  const m = text.match(/Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
+  if (!m) {
+    const data = { ok: false, reason: "eastmoney pingzhongdata missing Data_netWorthTrend" };
+    cacheSet(cacheKey, data);
+    return data;
+  }
 
-  res.json({ ok: true, code, historySource: hist.source || null, ...ind, build: BUILD_ID });
-});
+  let arr;
+  try {
+    arr = JSON.parse(m[1]);
+  } catch (e) {
+    const data = { ok: false, reason: `pingzhongdata json parse failed: ${String(e)}` };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+
+  const series = [];
+  for (const it of arr) {
+    // [timestamp, nav, equityReturn?, unitMoney?] or object forms; handle both
+    if (Array.isArray(it)) {
+      const ts = Number(it[0]);
+      const nav = safeNum(it[1]);
+      if (Number.isFinite(ts) && typeof nav === "number") {
+        const d = new Date(ts);
+        const date = d.toISOString().slice(0, 10);
+        series.push({ date, close: nav });
+      }
+    } else if (it && typeof it === "object") {
+      const ts = Number(it.x ?? it.date ?? it.time);
+      const nav = safeNum(it.y ?? it.nav ?? it.value);
+      if (Number.isFinite(ts) && typeof nav === "number") {
+        const d = new Date(ts);
+        const date = d.toISOString().slice(0, 10);
+        series.push({ date, close: nav });
+      }
+    }
+  }
+
+  if (!series.length) {
+    const data = { ok: false, reason: "cnfund empty history" };
+    cacheSet(cacheKey, data);
+    return data;
+  }
+
+  // sort and dedupe by date
+  series.sort((a, b) => a.date.localeCompare(b.date));
+  const dedup = [];
+  let lastD = "";
+  for (const x of series) {
+    if (x.date === lastD) continue;
+    lastD = x.date;
+    dedup.push(x);
+  }
+
+  const data = { ok: true, series: dedup.slice(-count), source: "eastmoney_pingzhongdata" };
+  cacheSet(cacheKey, data);
+  return data;
+}
 
 /* =========================
-   Tech: Market (stooq -> alphavantage)
+   Health + endpoints
 ========================= */
-app.get("/api/tech/stooq/:symbol", async (req, res) => {
-  const symbol = String(req.params.symbol || "").trim();
-  if (!symbol) return res.status(400).json({ ok: false, error: "symbol required" });
-
-  const hist = await fetchMarketHistory(symbol, 120);
-  if (!hist.ok) return res.json({ ok: false, symbol, reason: hist.reason, count: 0, debug: hist.debug || null, build: BUILD_ID });
-
-  const ind = calcIndicatorsFromSeries(hist.series);
-  if (ind.count < 60) return res.json({ ok: false, symbol, reason: "insufficient history", count: ind.count, source: hist.source, build: BUILD_ID });
-
-  res.json({ ok: true, symbol, source: hist.source, usedUrl: hist.usedUrl || null, ...ind, build: BUILD_ID });
+app.get("/health", (req, res) => {
+  res.json({ ok: true, build: BUILD_ID, tz: TZ });
 });
 
-/* =========================
-   Tech: batch for positions
-========================= */
+/* Batch tech for positions */
 app.post("/api/tech/batch", async (req, res) => {
   const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
   if (!positions.length) return res.status(400).json({ ok: false, error: "positions required" });
 
-  const out = [];
+  const items = [];
   for (const p of positions) {
-    const type = String(p.type || "");
-    const codeRaw = String(p.code || "");
-    const name = p.name || null;
+    const type = String(p.type || "").trim();
+    const code = String(p.code || "").trim();
+    if (!code) continue;
 
-    if (type === "CN_FUND") {
-      const code = normFundCode(codeRaw);
-      if (!code) { out.push({ ok: false, type, code: codeRaw, name, reason: "invalid fund code", count: 0 }); continue; }
-      const hist = await fetchCnFundHistory(code, 180);
-      if (!hist.ok) { out.push({ ok: false, type, code, name, reason: hist.reason || "history fetch failed", count: 0 }); continue; }
+    if (type === "CN_FUND" || /^\d{1,6}$/.test(code)) {
+      const fund = normFundCode(code);
+      const hist = await fetchCnFundHistory(fund, 180);
+      if (!hist.ok) {
+        items.push({ ok: false, code: fund, reason: hist.reason || "cnfund history failed", count: 0 });
+        continue;
+      }
       const ind = calcIndicatorsFromSeries(hist.series);
-      if (ind.count < 60) out.push({ ok: false, type, code, name, reason: "insufficient history", count: ind.count });
-      else out.push({ ok: true, type, code, name, source: hist.source || null, ...ind });
+      if (ind.count < 60) {
+        items.push({ ok: false, code: fund, reason: "insufficient history", count: ind.count });
+        continue;
+      }
+      items.push({ ok: true, code: fund, historySource: hist.source, ...ind });
       continue;
     }
 
-    if (type === "US_TICKER" || type === "SECTOR_ETF") {
-      const hist = await fetchMarketHistory(codeRaw, 120);
-      if (!hist.ok) { out.push({ ok: false, type, code: codeRaw, name, reason: hist.reason, count: 0 }); continue; }
-      const ind = calcIndicatorsFromSeries(hist.series);
-      if (ind.count < 60) out.push({ ok: false, type, code: codeRaw, name, reason: "insufficient history", count: ind.count });
-      else out.push({ ok: true, type, code: codeRaw, name, source: hist.source, ...ind });
+    const sym = code.toUpperCase();
+    const hist = await fetchMarketHistory(sym, 120);
+    if (!hist.ok) {
+      items.push({ ok: false, code: sym, reason: hist.reason || "market history failed", count: 0, debug: hist.debug || null });
       continue;
     }
-
-    out.push({ ok: false, type, code: codeRaw, name, reason: "unsupported type", count: 0 });
+    const ind = calcIndicatorsFromSeries(hist.series);
+    if (ind.count < 60) {
+      items.push({ ok: false, code: sym, reason: "insufficient history", count: ind.count });
+      continue;
+    }
+    items.push({ ok: true, code: sym, source: hist.source, ...ind });
   }
 
-  res.json({ ok: true, build: BUILD_ID, items: out });
+  res.json({ ok: true, build: BUILD_ID, items });
 });
 
-/* =========================
-   Sector scan (one request should be small; front-end will pace)
-========================= */
-function scoreSector(ind) {
-  let s = 0;
-  if (ind.last != null && ind.sma20 != null && ind.sma60 != null) {
-    if (ind.last > ind.sma20 && ind.sma20 > ind.sma60) s += 2;
-    else if (ind.last < ind.sma20 && ind.sma20 < ind.sma60) s -= 1;
-    else s += 1;
-  }
-  if (typeof ind.ret20 === "number") {
-    if (ind.ret20 >= 6) s += 2;
-    else if (ind.ret20 >= 2) s += 1;
-    else if (ind.ret20 <= -4) s -= 1;
-  }
-  if (typeof ind.rsi14 === "number") {
-    if (ind.rsi14 >= 70) s += 0.5;
-    else if (ind.rsi14 <= 30) s += 0.5;
-  }
-  return +s.toFixed(2);
-}
-
+/* Sector scan: supports US + CN_FUND */
 app.post("/api/sector/scan", async (req, res) => {
   const items = Array.isArray(req.body?.items) ? req.body.items : [];
   if (!items.length) return res.status(400).json({ ok: false, error: "items required" });
@@ -635,49 +410,43 @@ app.post("/api/sector/scan", async (req, res) => {
   const out = [];
   for (const it of items) {
     const theme = it.theme || "未分类";
-    const symbol = String(it.symbol || "").trim();
+    const market = String(it.market || it.type || "").trim(); // allow front-end to pass market/type
+    let symbol = String(it.symbol || it.code || "").trim();
     const name = it.name || null;
     if (!symbol) continue;
 
-    const hist = await fetchMarketHistory(symbol, 120);
-    if (!hist.ok) {
-      out.push({ theme, symbol, name, ok: false, reason: hist.reason || "history fetch failed", count: 0 });
+    // CN fund / ETF (6 digits) support for sector scan
+    const isCnFund = market === "CN_FUND" || /^\d{6}$/.test(symbol);
+    if (isCnFund) {
+      const code = normFundCode(symbol);
+      if (!code) {
+        out.push({ theme, market: "CN_FUND", symbol, name, ok: false, reason: "invalid fund code", count: 0 });
+        continue;
+      }
+      const hist = await fetchCnFundHistory(code, 180);
+      if (!hist.ok) {
+        out.push({ theme, market: "CN_FUND", symbol: code, name, ok: false, reason: hist.reason || "history fetch failed", count: 0 });
+        continue;
+      }
+      const ind = calcIndicatorsFromSeries(hist.series);
+      if (ind.count < 60) {
+        out.push({ theme, market: "CN_FUND", symbol: code, name, ok: false, reason: "insufficient history", count: ind.count });
+        continue;
+      }
+      out.push({
+        theme, market: "CN_FUND", symbol: code, name,
+        ok: true,
+        source: hist.source || "cn_fund_history",
+        count: ind.count,
+        last: ind.last,
+        sma20: ind.sma20,
+        sma60: ind.sma60,
+        rsi14: ind.rsi14,
+        ret20: ind.ret20,
+        macd: ind.macd,
+        hist: ind.hist,
+        score: scoreSector(ind),
+      });
       continue;
     }
 
-    const ind = calcIndicatorsFromSeries(hist.series);
-    if (ind.count < 60) {
-      out.push({ theme, symbol, name, ok: false, reason: "insufficient history", count: ind.count });
-      continue;
-    }
-
-    out.push({
-      theme, symbol, name,
-      ok: true,
-      source: hist.source,
-      count: ind.count,
-      last: ind.last,
-      sma20: ind.sma20,
-      sma60: ind.sma60,
-      rsi14: ind.rsi14,
-      ret20: ind.ret20,
-      macd: ind.macd,
-      hist: ind.hist,
-      score: scoreSector(ind),
-    });
-  }
-
-  const okOnes = out.filter((x) => x.ok);
-  okOnes.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  const top = okOnes.slice(0, 3);
-
-  res.json({ ok: true, build: BUILD_ID, top, items: out });
-});
-
-/* =========================
-   Start
-========================= */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("server listening", PORT, { build: BUILD_ID });
-});
