@@ -2,18 +2,11 @@ import express from "express";
 import cors from "cors";
 
 /**
- * NEON QUANT backend (replacement v3)
- * - health
- * - tech indicators (CN fund via Eastmoney pingzhongdata; US ticker via AlphaVantage)
- * - sector scan (same indicator engine + score + tags)
- * - risk check (simple concentration heuristic)
- * - news rss (lightweight parser, no extra deps)
- * - ai chat proxy (OpenAI-compatible /v1/chat/completions)
+ * NEON QUANT backend (replacement v4)
  *
- * Notes:
- * 1) This is NOT financial advice. Endpoints only provide data + heuristics.
- * 2) CN fund data source: Eastmoney pingzhongdata JS.
- * 3) US market data source: AlphaVantage (set ALPHAVANTAGE_KEY in env).
+ * v4 fixes:
+ * 1) Add /api/meta/resolve to auto-resolve CN fund/ETF name (Eastmoney) and US ticker name (AlphaVantage search if key set).
+ * 2) News RSS: add Sina Finance RSS as CN preset; when keyword-matched=0, fallback to latest headlines (avoid 0 list).
  */
 
 const app = express();
@@ -26,10 +19,9 @@ const TZ = process.env.TZ || "Asia/Shanghai";
 const AV_KEY = process.env.ALPHAVANTAGE_KEY || "";
 
 /* =========================
-   Simple in-memory cache
+   In-memory cache
 ========================= */
 const CACHE = new Map();
-/** @param {string} k */
 function cacheGet(k) {
   const v = CACHE.get(k);
   if (!v) return null;
@@ -39,7 +31,6 @@ function cacheGet(k) {
   }
   return v.val;
 }
-/** @param {string} k @param {any} val @param {number} ttlMs */
 function cacheSet(k, val, ttlMs = 10 * 60 * 1000) {
   CACHE.set(k, { val, exp: Date.now() + ttlMs });
 }
@@ -57,12 +48,11 @@ async function fetchWithTimeout(url, opts = {}) {
 }
 
 /* =========================
-   Utilities
+   Helpers
 ========================= */
 function normFundCode(code) {
   const s = String(code || "").trim();
   if (!s) return "";
-  // pad left to 6 digits
   if (/^\d{1,6}$/.test(s)) return s.padStart(6, "0");
   return s;
 }
@@ -110,7 +100,6 @@ function rsi14(closes, n = 14) {
 }
 function macd(closes) {
   if (!Array.isArray(closes) || closes.length < 35) return { macd: null, signal: null, hist: null };
-  // compute full series for signal
   const e12Series = [];
   const e26Series = [];
   let e12 = closes[0], e26 = closes[0];
@@ -128,9 +117,7 @@ function macd(closes) {
   const hist = (sig == null) ? null : (m - sig);
   return { macd: m, signal: sig, hist };
 }
-
 function calcIndicatorsFromSeries(series) {
-  // series: [{date, close}] ascending by date
   const closes = series.map((x) => x.close).filter((x) => typeof x === "number");
   const count = closes.length;
   const last = count ? closes[count - 1] : null;
@@ -151,37 +138,30 @@ function calcIndicatorsFromSeries(series) {
     hist: m.hist,
   };
 }
-
 function makeTags(ind) {
   const tags = [];
-  // Trend
   if (typeof ind.sma20 === "number" && typeof ind.sma60 === "number") {
     if (ind.sma20 > ind.sma60 * 1.002) tags.push("趋势上行");
     else if (ind.sma20 < ind.sma60 * 0.998) tags.push("趋势下行");
     else tags.push("趋势震荡");
   }
-  // Momentum
   if (typeof ind.ret20 === "number") {
     if (ind.ret20 >= 6) tags.push("动量强");
     else if (ind.ret20 <= -6) tags.push("动量弱");
     else tags.push("动量平");
   }
-  // RSI
   if (typeof ind.rsi14 === "number") {
     if (ind.rsi14 >= 70) tags.push("RSI偏热");
     else if (ind.rsi14 <= 30) tags.push("RSI偏冷");
     else tags.push("RSI中性");
   }
-  // MACD
   if (typeof ind.hist === "number") {
     if (ind.hist > 0) tags.push("MACD偏强");
     else if (ind.hist < 0) tags.push("MACD偏弱");
   }
   return tags;
 }
-
 function scoreSector(ind) {
-  // simple score: trend + momentum + rsi penalty
   let s = 0;
   if (typeof ind.sma20 === "number" && typeof ind.sma60 === "number") {
     if (ind.sma20 > ind.sma60) s += 2;
@@ -201,13 +181,11 @@ function scoreSector(ind) {
 /* =========================
    Data fetchers
 ========================= */
-
-// CN fund/ETF history (net worth trend) from Eastmoney pingzhongdata JS
-async function fetchCnFundHistory(code, days = 200) {
+async function fetchCnFundJs(code) {
   const fund = normFundCode(code);
   if (!fund) return { ok: false, reason: "empty code" };
 
-  const cacheKey = `cnfund:${fund}:${days}`;
+  const cacheKey = `cnfundjs:${fund}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
@@ -219,26 +197,42 @@ async function fetchCnFundHistory(code, days = 200) {
     return data;
   }
   const js = await r.text();
+  const data = { ok: true, fund, js };
+  cacheSet(cacheKey, data, 10 * 60 * 1000);
+  return data;
+}
 
-  // Extract:
-  // Data_netWorthTrend = [[timestamp, netWorth], ...]
+async function fetchCnFundHistory(code, days = 200) {
+  const fund = normFundCode(code);
+  if (!fund) return { ok: false, reason: "empty code" };
+
+  const cacheKey = `cnfund:${fund}:${days}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const jsRes = await fetchCnFundJs(fund);
+  if (!jsRes.ok) {
+    cacheSet(cacheKey, jsRes, 2 * 60 * 1000);
+    return jsRes;
+  }
+  const js = jsRes.js;
+
   const m = js.match(/Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/);
   if (!m) {
     const data = { ok: false, reason: "cannot find Data_netWorthTrend" };
     cacheSet(cacheKey, data, 2 * 60 * 1000);
     return data;
   }
+
   let arr = null;
   try {
     arr = JSON.parse(m[1]);
   } catch (e) {
-    // Sometimes it's array of objects. Try a looser eval-like parse is risky; instead fail safely.
     const data = { ok: false, reason: "netWorthTrend json parse failed" };
     cacheSet(cacheKey, data, 2 * 60 * 1000);
     return data;
   }
 
-  // arr can be [{x: timestamp, y: netWorth}, ...] or [[t, v], ...]
   const series = [];
   for (const it of arr) {
     let t = null, v = null;
@@ -253,14 +247,12 @@ async function fetchCnFundHistory(code, days = 200) {
     series.push({ date: new Date(t).toISOString().slice(0, 10), close: v });
   }
 
-  // keep last N days
   const trimmed = series.slice(-days);
   const data = { ok: true, source: "eastmoney_pingzhongdata", series: trimmed };
   cacheSet(cacheKey, data, 10 * 60 * 1000);
   return data;
 }
 
-// US market history from AlphaVantage
 async function fetchMarketHistory(symbol, days = 140) {
   const sym = normTicker(symbol);
   if (!sym) return { ok: false, reason: "empty symbol" };
@@ -286,14 +278,14 @@ async function fetchMarketHistory(symbol, days = 140) {
     return data;
   }
 
-  const ts = j["Time Series (Daily)"] || j["Time Series (Daily Adjusted)"] || j["Time Series (Daily) "];
+  const ts = j["Time Series (Daily)"] || j["Time Series (Daily Adjusted)"];
   if (!ts || typeof ts !== "object") {
     const data = { ok: false, reason: "alphavantage missing time series", debug: j };
     cacheSet(cacheKey, data, 2 * 60 * 1000);
     return data;
   }
 
-  const dates = Object.keys(ts).sort(); // ascending
+  const dates = Object.keys(ts).sort();
   const series = [];
   for (const d of dates) {
     const row = ts[d];
@@ -313,6 +305,53 @@ async function fetchMarketHistory(symbol, days = 140) {
 ========================= */
 app.get("/health", (req, res) => {
   res.json({ ok: true, build: BUILD_ID, tz: TZ, av_key: AV_KEY ? "set" : "missing" });
+});
+
+/* =========================
+   Meta resolve (NEW)
+========================= */
+app.post("/api/meta/resolve", async (req, res) => {
+  const type = String(req.body?.type || "").trim();
+  const codeRaw = String(req.body?.code || "").trim();
+
+  if (!codeRaw) return res.status(400).json({ ok: false, error: "code required" });
+
+  // CN fund/ETF: from Eastmoney pingzhongdata
+  if (type === "CN_FUND" || /^\d{6}$/.test(codeRaw)) {
+    const code = normFundCode(codeRaw);
+    const jsRes = await fetchCnFundJs(code);
+    if (!jsRes.ok) return res.json({ ok: false, error: jsRes.reason || "eastmoney fetch failed" });
+
+    const js = jsRes.js;
+    // Examples inside pingzhongdata: var fS_name="xxx"; var fS_fullname="xxx";
+    const name = (js.match(/fS_name\s*=\s*"([^"]+)"/)?.[1] || "").trim();
+    const fullname = (js.match(/fS_fullname\s*=\s*"([^"]+)"/)?.[1] || "").trim();
+    const out = fullname || name || "";
+    return res.json({ ok: true, code, name: out });
+  }
+
+  // US ticker: AlphaVantage SYMBOL_SEARCH if key set
+  const sym = normTicker(codeRaw);
+  if (!AV_KEY) return res.json({ ok: true, code: sym, name: "" });
+
+  const cacheKey = `avsearch:${sym}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return res.json(cached);
+
+  try {
+    const url = `https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords=${encodeURIComponent(sym)}&apikey=${encodeURIComponent(AV_KEY)}`;
+    const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+    if (!r.ok) return res.json({ ok: true, code: sym, name: "" });
+
+    const j = await r.json();
+    const best = Array.isArray(j?.bestMatches) ? j.bestMatches[0] : null;
+    const name = (best?.["2. name"] || best?.["1. symbol"] || "").trim();
+    const out = { ok: true, code: sym, name };
+    cacheSet(cacheKey, out, 6 * 60 * 60 * 1000);
+    return res.json(out);
+  } catch (e) {
+    return res.json({ ok: true, code: sym, name: "" });
+  }
 });
 
 /* =========================
@@ -372,7 +411,7 @@ app.post("/api/sector/scan", async (req, res) => {
   const out = [];
   for (const it of items) {
     const theme = it.theme || "未分类";
-    const market = String(it.market || it.type || "").trim(); // allow front-end to pass market/type
+    const market = String(it.market || it.type || "").trim();
     let symbol = String(it.symbol || it.code || "").trim();
     const name = it.name || null;
     if (!symbol) continue;
@@ -432,7 +471,7 @@ app.post("/api/sector/scan", async (req, res) => {
 });
 
 /* =========================
-   Risk check (simple heuristic)
+   Risk check
 ========================= */
 app.post("/api/risk/check", async (req, res) => {
   const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
@@ -483,7 +522,7 @@ app.post("/api/risk/check", async (req, res) => {
 });
 
 /* =========================
-   News RSS (lightweight parser)
+   News RSS (CN + US) with fallback
 ========================= */
 const RSS_PRESETS = {
   us: [
@@ -492,16 +531,22 @@ const RSS_PRESETS = {
     "https://www.cnbc.com/id/100003114/device/rss/rss.html",
     "https://www.marketwatch.com/rss/topstories",
   ],
+  // CN preset: Sina Finance RSS endpoints (stable public RSS)
+  // Sources: rss.sina.com.cn provides finance RSS feeds.
   cn: [
-    // These might not be reachable in all networks; user can switch to custom.
-    "https://rsshub.app/36kr/newsflashes",
-    "https://rsshub.app/jin10",
+    "https://rss.sina.com.cn/roll/finance/hot_roll.xml",
+    "https://rss.sina.com.cn/finance/fund.xml",
+    "https://rss.sina.com.cn/finance/stock.xml",
+    "https://rss.sina.com.cn/finance/industry.xml",
+    "https://rss.sina.com.cn/finance/financial.xml",
+    "https://rss.sina.com.cn/bn/finance.xml",
   ],
   mixed: [
     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     "https://www.cnbc.com/id/100003114/device/rss/rss.html",
     "https://www.marketwatch.com/rss/topstories",
-    "https://rsshub.app/36kr/newsflashes",
+    "https://rss.sina.com.cn/roll/finance/hot_roll.xml",
+    "https://rss.sina.com.cn/finance/stock.xml",
   ],
 };
 
@@ -553,8 +598,8 @@ function parseRssOrAtom(xml) {
 
 function guessSentiment(title, summary) {
   const t = (title + " " + summary).toLowerCase();
-  const good = ["beats", "surge", "rally", "record", "rate cut", "stimulus", "approval", "upgrade", "strong", "cooling inflation"];
-  const bad  = ["miss", "plunge", "sell-off", "downgrade", "lawsuit", "crackdown", "ban", "default", "recession", "war", "inflation heats"];
+  const good = ["beats", "surge", "rally", "record", "rate cut", "stimulus", "approval", "upgrade", "strong", "cooling inflation", "上涨", "利好", "降息", "降准", "回暖"];
+  const bad  = ["miss", "plunge", "sell-off", "downgrade", "lawsuit", "crackdown", "ban", "default", "recession", "war", "inflation heats", "下跌", "利空", "收紧", "爆雷", "停摆"];
   if (good.some((w) => t.includes(w))) return "利好";
   if (bad.some((w) => t.includes(w))) return "利空";
   return "中性";
@@ -576,7 +621,8 @@ app.post("/api/news/rss", async (req, res) => {
   const feeds = rssList.filter(Boolean).slice(0, 20);
 
   const seen = new Set();
-  const items = [];
+  const matched = [];
+  const all = [];
 
   for (const url of feeds) {
     try {
@@ -586,14 +632,11 @@ app.post("/api/news/rss", async (req, res) => {
       const parsed = parseRssOrAtom(xml);
 
       for (const it of parsed) {
-        const hay = `${it.title} ${it.summary}`;
-        if (kws.length && !includesAny(hay, kws)) continue;
-
         const key = (it.link || it.title || "").slice(0, 240);
         if (!key || seen.has(key)) continue;
         seen.add(key);
 
-        items.push({
+        const item = {
           title: it.title,
           link: it.link,
           pubDate: it.pubDate,
@@ -602,20 +645,32 @@ app.post("/api/news/rss", async (req, res) => {
           sentiment: guessSentiment(it.title, it.summary),
           topics: [],
           market: preset === "us" ? "US" : preset === "cn" ? "CN" : "MIX",
-        });
-        if (items.length >= limit) break;
+        };
+        all.push(item);
+
+        const hay = `${it.title} ${it.summary}`;
+        if (!kws.length || includesAny(hay, kws)) {
+          matched.push(item);
+        }
+
+        if (matched.length >= limit && all.length >= limit * 3) break;
       }
-      if (items.length >= limit) break;
-    } catch (e) {
+      if (matched.length >= limit && all.length >= limit * 3) break;
+    } catch {
       // ignore feed errors
     }
   }
 
-  res.json({ ok: true, build: BUILD_ID, items });
+  // Fallback: if matched is 0, return top headlines (avoid empty list)
+  if (kws.length && matched.length === 0) {
+    return res.json({ ok: true, build: BUILD_ID, matched: 0, fallback: true, items: all.slice(0, limit) });
+  }
+
+  res.json({ ok: true, build: BUILD_ID, matched: matched.length, fallback: false, items: matched.slice(0, limit) });
 });
 
 /* =========================
-   AI chat proxy (OpenAI-compatible)
+   AI chat proxy
 ========================= */
 const SYSTEM_PROMPT = `
 你是严谨的投研助理（非理财顾问）。必须遵守：
@@ -681,7 +736,6 @@ app.post("/api/ai/chat", async (req, res) => {
     });
 
     const text = await r.text();
-    // return raw (OpenAI-compatible)
     res.status(r.status).send(text);
   } catch (e) {
     res.status(500).json({ ok: false, error: e?.message || String(e) });
