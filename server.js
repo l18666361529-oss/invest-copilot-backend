@@ -304,13 +304,73 @@ async function fetchMarketHistory(symbol, days = 140) {
 /* =========================
    Quotes (CN realtime估值/净值 via fundgz; US price via AlphaVantage GLOBAL_QUOTE)
 ========================= */
-async function fetchCnFundQuote(code) {
+
+async function fetchCnFundOfficialNav(code, force=false) {
+  const fund = normFundCode(code);
+  if (!fund) return { ok: false, reason: "empty code" };
+
+  const cacheKey = `emnav:${fund}`;
+  if (!force) {
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+  }
+
+  // Eastmoney F10 historical NAV (latest row usually the most recent published NAV)
+  // Example: https://fund.eastmoney.com/f10/F10DataApi.aspx?type=lsjz&code=025167&page=1&per=20
+  const url = `https://fund.eastmoney.com/f10/F10DataApi.aspx?type=lsjz&code=${encodeURIComponent(fund)}&page=1&per=20`;
+  const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+  if (!r.ok) {
+    const data = { ok: false, reason: `eastmoney f10 status=${r.status}` };
+    cacheSet(cacheKey, data, 30 * 1000);
+    return data;
+  }
+  const txt = await r.text();
+
+  // Extract table rows
+  const rows = txt.match(/<tr[\s\S]*?<\/tr>/gi) || [];
+  // Find first data row that has <td> date
+  for (const row of rows) {
+    const tds = [];
+    const reTd = /<td[^>]*>([\s\S]*?)<\/td>/gi;
+    let m;
+    while ((m = reTd.exec(row)) !== null) {
+      const cell = String(m[1] || "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      tds.push(cell);
+    }
+    if (tds.length >= 2 && /^\d{4}-\d{2}-\d{2}$/.test(tds[0])) {
+      const navDate = tds[0];
+      const nav = toNum(tds[1]);
+      const acc = toNum(tds[2]);
+      const data = {
+        ok: true,
+        code: fund,
+        navDate,
+        nav,
+        accNav: acc,
+        source: "eastmoney_f10",
+      };
+      cacheSet(cacheKey, data, 60 * 1000); // cache 60s
+      return data;
+    }
+  }
+
+  const data = { ok: false, reason: "eastmoney f10 parse failed" };
+  cacheSet(cacheKey, data, 30 * 1000);
+  return data;
+}
+
+async function fetchCnFundQuote(code, force=false) {
   const fund = normFundCode(code);
   if (!fund) return { ok: false, reason: "empty code" };
 
   const cacheKey = `fundgz:${fund}`;
-  const cached = cacheGet(cacheKey);
-  if (cached) return cached;
+  if (!force) {
+    const cached = cacheGet(cacheKey);
+    if (cached) return cached;
+  }
 
   // fundgz returns JSONP: jsonpgz({...});
   const url = `https://fundgz.1234567.com.cn/js/${encodeURIComponent(fund)}.js?rt=${Date.now()}`;
@@ -345,7 +405,25 @@ async function fetchCnFundQuote(code) {
     estTime: (j.gztime || "").trim(),   // 估值时间
     source: "fundgz",
   };
-  cacheSet(cacheKey, data, 45 * 1000);
+
+  // 同步“官方已公布单位净值”：若 Eastmoney F10 的最新净值日期更新，则用它覆盖 fundgz 的 dwjz/jzrq
+  try {
+    const off = await fetchCnFundOfficialNav(fund, force);
+    if (off && off.ok && off.navDate) {
+      data.officialNavDate = off.navDate;
+      data.officialNav = off.nav;
+      data.officialSource = off.source;
+      // 如果官方净值日期更“新”，则以官方为准
+      if (data.navDate && off.navDate > data.navDate) {
+        data.navDate = off.navDate;
+        if (off.nav != null) data.nav = off.nav;
+      }
+    }
+  } catch {
+    // ignore official nav errors
+  }
+
+  cacheSet(cacheKey, data, 20 * 1000);
   return data;
 }
 
@@ -403,6 +481,7 @@ app.get("/health", (req, res) => {
 ========================= */
 app.post("/api/quote/batch", async (req, res) => {
   const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
+  const force = !!req.body?.force;
   if (!positions.length) return res.status(400).json({ ok: false, error: "positions required" });
 
   const items = [];
@@ -413,7 +492,7 @@ app.post("/api/quote/batch", async (req, res) => {
 
     const isCn = type === "CN_FUND" || /^\d{6}$/.test(code);
     if (isCn) {
-      const q = await fetchCnFundQuote(code);
+      const q = await fetchCnFundQuote(code, force);
       if (!q.ok) {
         items.push({ ok: false, code: normFundCode(code), reason: q.reason || "cn quote failed" });
       } else {
