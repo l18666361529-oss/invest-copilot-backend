@@ -300,11 +300,139 @@ async function fetchMarketHistory(symbol, days = 140) {
   return data;
 }
 
+
+/* =========================
+   Quotes (CN realtime估值/净值 via fundgz; US price via AlphaVantage GLOBAL_QUOTE)
+========================= */
+async function fetchCnFundQuote(code) {
+  const fund = normFundCode(code);
+  if (!fund) return { ok: false, reason: "empty code" };
+
+  const cacheKey = `fundgz:${fund}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  // fundgz returns JSONP: jsonpgz({...});
+  const url = `https://fundgz.1234567.com.cn/js/${encodeURIComponent(fund)}.js?rt=${Date.now()}`;
+  const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
+  if (!r.ok) {
+    const data = { ok: false, reason: `fundgz status=${r.status}` };
+    cacheSet(cacheKey, data, 30 * 1000);
+    return data;
+  }
+  const txt = await r.text();
+  const m = txt.match(/jsonpgz\((\{[\s\S]*\})\)\s*;?/i);
+  if (!m) {
+    const data = { ok: false, reason: "fundgz parse failed" };
+    cacheSet(cacheKey, data, 30 * 1000);
+    return data;
+  }
+  let j = null;
+  try { j = JSON.parse(m[1]); } catch {
+    const data = { ok: false, reason: "fundgz json parse failed" };
+    cacheSet(cacheKey, data, 30 * 1000);
+    return data;
+  }
+
+  const data = {
+    ok: true,
+    code: fund,
+    name: (j.name || "").trim(),
+    navDate: (j.jzrq || "").trim(),     // 净值日期
+    nav: toNum(j.dwjz),                 // 单位净值
+    est: toNum(j.gsz),                  // 估算净值
+    estPct: toNum(j.gszzl),             // 估算涨跌幅(%)
+    estTime: (j.gztime || "").trim(),   // 估值时间
+    source: "fundgz",
+  };
+  cacheSet(cacheKey, data, 45 * 1000);
+  return data;
+}
+
+async function fetchUsQuote(symbol) {
+  const sym = normTicker(symbol);
+  if (!sym) return { ok: false, reason: "empty symbol" };
+  if (!AV_KEY) return { ok: false, reason: "missing ALPHAVANTAGE_KEY" };
+
+  const cacheKey = `avquote:${sym}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const url = `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(sym)}&apikey=${encodeURIComponent(AV_KEY)}`;
+  const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
+  if (!r.ok) {
+    const data = { ok: false, reason: `alphavantage status=${r.status}` };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+  const j = await r.json();
+  const note = j?.Note || j?.Information;
+  if (note) {
+    const data = { ok: false, reason: "alphavantage rate limit / info", debug: note };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+  const q = j["Global Quote"];
+  if (!q) {
+    const data = { ok: false, reason: "alphavantage missing Global Quote", debug: j };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+
+  const data = {
+    ok: true,
+    code: sym,
+    name: "",
+    navDate: (q["07. latest trading day"] || "").trim(),
+    price: toNum(q["05. price"]),
+    changePct: toNum(String(q["10. change percent"] || "").replace("%","")),
+    source: "alphavantage",
+  };
+  cacheSet(cacheKey, data, 60 * 1000);
+  return data;
+}
+
 /* =========================
    Health
 ========================= */
 app.get("/health", (req, res) => {
   res.json({ ok: true, build: BUILD_ID, tz: TZ, av_key: AV_KEY ? "set" : "missing" });
+
+/* =========================
+   Quote batch (for refresh NAV/price)
+========================= */
+app.post("/api/quote/batch", async (req, res) => {
+  const positions = Array.isArray(req.body?.positions) ? req.body.positions : [];
+  if (!positions.length) return res.status(400).json({ ok: false, error: "positions required" });
+
+  const items = [];
+  for (const p of positions) {
+    const type = String(p.type || "").trim();
+    const code = String(p.code || "").trim();
+    if (!code) continue;
+
+    const isCn = type === "CN_FUND" || /^\d{6}$/.test(code);
+    if (isCn) {
+      const q = await fetchCnFundQuote(code);
+      if (!q.ok) {
+        items.push({ ok: false, code: normFundCode(code), reason: q.reason || "cn quote failed" });
+      } else {
+        items.push(q);
+      }
+      continue;
+    }
+
+    const q = await fetchUsQuote(code);
+    if (!q.ok) {
+      items.push({ ok: false, code: normTicker(code), reason: q.reason || "us quote failed", debug: q.debug || null });
+    } else {
+      items.push(q);
+    }
+  }
+
+  res.json({ ok: true, build: BUILD_ID, items });
+});
+
 });
 
 /* =========================
