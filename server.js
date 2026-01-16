@@ -253,10 +253,111 @@ async function fetchCnFundHistory(code, days = 200) {
   return data;
 }
 
+
+
+async function fetchMarketHistoryYahoo(symbol, days = 180) {
+  const sym = normTicker(symbol);
+  if (!sym) return { ok: false, reason: "empty symbol" };
+
+  const cacheKey = `yahoo:${sym}:${days}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  // Yahoo Finance chart API (no key)
+  // Example: https://query1.finance.yahoo.com/v8/finance/chart/QQQ?range=1y&interval=1d
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?range=1y&interval=1d&includeAdjustedClose=true`;
+  const r = await fetchWithTimeout(url, { timeoutMs: 20000, headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!r.ok) {
+    const data = { ok: false, reason: `yahoo status=${r.status}` };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+  const j = await r.json();
+  const result = j?.chart?.result?.[0];
+  const timestamps = result?.timestamp;
+  const closes = result?.indicators?.adjclose?.[0]?.adjclose || result?.indicators?.quote?.[0]?.close;
+
+  if (!Array.isArray(timestamps) || !Array.isArray(closes) || timestamps.length < 60) {
+    const data = { ok: false, reason: "yahoo parse failed", debug: j?.chart?.error || null };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+
+  const series = [];
+  for (let i = 0; i < timestamps.length; i++) {
+    const ts = timestamps[i];
+    const c = toNum(closes[i]);
+    if (!isFinite(ts) || c == null) continue;
+    const d = new Date(ts * 1000).toISOString().slice(0, 10);
+    series.push({ date: d, close: c });
+  }
+
+  if (series.length < 60) {
+    const data = { ok: false, reason: "yahoo insufficient history", count: series.length };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+
+  const trimmed = series.slice(-days);
+  const data = { ok: true, source: "yahoo", series: trimmed };
+  cacheSet(cacheKey, data, 10 * 60 * 1000);
+  return data;
+}
+
+async function fetchMarketHistoryStooq(symbol, days = 160) {
+  // Stooq free daily data, symbol format often like qqq.us (lowercase)
+  const sym = normTicker(symbol);
+  if (!sym) return { ok: false, reason: "empty symbol" };
+
+  const stooqSym = sym.toLowerCase() + ".us";
+  const cacheKey = `stooq:${stooqSym}:${days}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) return cached;
+
+  const url = `https://stooq.com/q/d/l/?s=${encodeURIComponent(stooqSym)}&i=d`;
+  const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+  if (!r.ok) {
+    const data = { ok: false, reason: `stooq status=${r.status}` };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+  const txt = await r.text();
+  // CSV: Date,Open,High,Low,Close,Volume
+  const lines = txt.trim().split(/\r?\n/);
+  if (lines.length < 20) {
+    const data = { ok: false, reason: "stooq insufficient data" };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+  const series = [];
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(",");
+    if (parts.length < 5) continue;
+    const date = parts[0];
+    const close = toNum(parts[4]);
+    if (!date || close == null) continue;
+    series.push({ date, close });
+  }
+  if (series.length < 60) {
+    const data = { ok: false, reason: "stooq insufficient history", count: series.length };
+    cacheSet(cacheKey, data, 60 * 1000);
+    return data;
+  }
+  const trimmed = series.slice(-days);
+  const data = { ok: true, source: "stooq", series: trimmed };
+  cacheSet(cacheKey, data, 10 * 60 * 1000);
+  return data;
+}
+
 async function fetchMarketHistory(symbol, days = 140) {
   const sym = normTicker(symbol);
   if (!sym) return { ok: false, reason: "empty symbol" };
-  if (!AV_KEY) return { ok: false, reason: "missing ALPHAVANTAGE_KEY" };
+  // 如果没有 AlphaVantage Key：先用 Yahoo（更全），再降级 Stooq
+  if (!AV_KEY) {
+    const yh = await fetchMarketHistoryYahoo(sym, days);
+    if (yh.ok) return yh;
+    return await fetchMarketHistoryStooq(sym, days);
+  }
 
   const cacheKey = `av:${sym}:${days}`;
   const cached = cacheGet(cacheKey);
@@ -273,6 +374,13 @@ async function fetchMarketHistory(symbol, days = 140) {
 
   const note = j?.Note || j?.Information;
   if (note) {
+    // 触发限流时：先用 Yahoo，再降级 Stooq
+    const yh = await fetchMarketHistoryYahoo(sym, days);
+    if (yh.ok) return yh;
+    const yh = await fetchMarketHistoryYahoo(sym, days);
+    if (yh.ok) return yh;
+    const fb = await fetchMarketHistoryStooq(sym, days);
+    if (fb.ok) return fb;
     const data = { ok: false, reason: "alphavantage rate limit / info", debug: note };
     cacheSet(cacheKey, data, 60 * 1000);
     return data;
@@ -280,6 +388,10 @@ async function fetchMarketHistory(symbol, days = 140) {
 
   const ts = j["Time Series (Daily)"] || j["Time Series (Daily Adjusted)"];
   if (!ts || typeof ts !== "object") {
+    const yh = await fetchMarketHistoryYahoo(sym, days);
+    if (yh.ok) return yh;
+    const fb = await fetchMarketHistoryStooq(sym, days);
+    if (fb.ok) return fb;
     const data = { ok: false, reason: "alphavantage missing time series", debug: j };
     cacheSet(cacheKey, data, 2 * 60 * 1000);
     return data;
@@ -430,7 +542,12 @@ async function fetchCnFundQuote(code, force=false) {
 async function fetchUsQuote(symbol) {
   const sym = normTicker(symbol);
   if (!sym) return { ok: false, reason: "empty symbol" };
-  if (!AV_KEY) return { ok: false, reason: "missing ALPHAVANTAGE_KEY" };
+  // 如果没有 AlphaVantage Key：先用 Yahoo（更全），再降级 Stooq
+  if (!AV_KEY) {
+    const yh = await fetchMarketHistoryYahoo(sym, days);
+    if (yh.ok) return yh;
+    return await fetchMarketHistoryStooq(sym, days);
+  }
 
   const cacheKey = `avquote:${sym}`;
   const cached = cacheGet(cacheKey);
@@ -446,6 +563,13 @@ async function fetchUsQuote(symbol) {
   const j = await r.json();
   const note = j?.Note || j?.Information;
   if (note) {
+    // 触发限流时：先用 Yahoo，再降级 Stooq
+    const yh = await fetchMarketHistoryYahoo(sym, days);
+    if (yh.ok) return yh;
+    const yh = await fetchMarketHistoryYahoo(sym, days);
+    if (yh.ok) return yh;
+    const fb = await fetchMarketHistoryStooq(sym, days);
+    if (fb.ok) return fb;
     const data = { ok: false, reason: "alphavantage rate limit / info", debug: note };
     cacheSet(cacheKey, data, 60 * 1000);
     return data;
@@ -777,6 +901,30 @@ function includesAny(text, kws) {
   return kws.some((k) => t.includes(k));
 }
 
+// --- News date helpers (prevent very old RSS items from polluting results) ---
+function parseDateMs(s) {
+  const raw = String(s || "").trim();
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (!isNaN(d.getTime())) return d.getTime();
+  return null;
+}
+
+function extractYear(s) {
+  const m = String(s || "").match(/(19|20)\d{2}/);
+  if (!m) return null;
+  const y = Number(m[0]);
+  return Number.isFinite(y) ? y : null;
+}
+
+function toIsoDate(ts) {
+  try {
+    return new Date(ts).toISOString().slice(0, 10);
+  } catch {
+    return "";
+  }
+}
+
 function parseRssOrAtom(xml) {
   const out = [];
 
@@ -817,6 +965,8 @@ app.post("/api/news/rss", async (req, res) => {
   const kwEn = String(req.body?.kwEn || "");
   const preset = String(req.body?.preset || "mixed");
   const limit = Math.max(5, Math.min(50, Number(req.body?.limit || 18)));
+  // Only keep recent items (default: last 7 days)
+  const days = Math.max(1, Math.min(30, Number(req.body?.days || 7)));
   const customRss = Array.isArray(req.body?.customRss) ? req.body.customRss : [];
 
   const kws = splitKeywords(kwZh).concat(splitKeywords(kwEn)).map((x) => x.toLowerCase());
@@ -831,6 +981,9 @@ app.post("/api/news/rss", async (req, res) => {
   const matched = [];
   const all = [];
 
+  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  const curYear = new Date().getFullYear();
+
   for (const url of feeds) {
     try {
       const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
@@ -839,6 +992,15 @@ app.post("/api/news/rss", async (req, res) => {
       const parsed = parseRssOrAtom(xml);
 
       for (const it of parsed) {
+        // Filter out very old items (RSS sources sometimes include stale entries)
+        const ts = parseDateMs(it.pubDate);
+        if (ts && ts < cutoffMs) continue;
+        if (!ts) {
+          // Heuristic: if we can see an explicit year in link/title/pubDate and it's not this year, drop it.
+          const y = extractYear(it.pubDate) || extractYear(it.link) || extractYear(it.title);
+          if (y && y < curYear) continue;
+        }
+
         const key = (it.link || it.title || "").slice(0, 240);
         if (!key || seen.has(key)) continue;
         seen.add(key);
@@ -846,7 +1008,8 @@ app.post("/api/news/rss", async (req, res) => {
         const item = {
           title: it.title,
           link: it.link,
-          pubDate: it.pubDate,
+          pubDate: ts ? toIsoDate(ts) : it.pubDate,
+          ts: ts || null,
           source: url.replace(/^https?:\/\//, "").split("/")[0],
           summary: it.summary,
           sentiment: guessSentiment(it.title, it.summary),
@@ -867,6 +1030,11 @@ app.post("/api/news/rss", async (req, res) => {
       // ignore feed errors
     }
   }
+
+  // Sort by time desc (null at the end)
+  const sortByTs = (a, b) => (b.ts || 0) - (a.ts || 0);
+  matched.sort(sortByTs);
+  all.sort(sortByTs);
 
   // Fallback: if matched is 0, return top headlines (avoid empty list)
   if (kws.length && matched.length === 0) {
