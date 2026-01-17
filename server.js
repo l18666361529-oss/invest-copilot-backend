@@ -872,12 +872,17 @@ const RSS_PRESETS = {
     "https://rss.sina.com.cn/finance/financial.xml",
     "https://rss.sina.com.cn/bn/finance.xml",
   ],
-  mixed: [
+    mixed: [
+    // English (4) - faster global market news
     "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "http://feeds.bbci.co.uk/news/business/rss.xml",
     "https://www.marketwatch.com/rss/topstories",
+    // Chinese (4) - domestic policy & market coverage
     "https://rss.sina.com.cn/roll/finance/hot_roll.xml",
     "https://rss.sina.com.cn/finance/stock.xml",
+    "https://rss.sina.com.cn/finance/fund.xml",
+    "https://rss.sina.com.cn/finance/industry.xml",
   ],
 };
 
