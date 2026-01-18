@@ -857,32 +857,35 @@ app.post("/api/risk/check", async (req, res) => {
 ========================= */
 const RSS_PRESETS = {
   us: [
-    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    "https://www.marketwatch.com/rss/topstories",
+    // English (US) - market/macro, generally accessible
+    "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en",
+    "https://www.investing.com/rss/news_25.rss",
+    "https://www.investing.com/rss/news_301.rss",
+    "https://www.fxstreet.com/rss/news",
+    "https://www.nasdaq.com/feed/rssoutbound?category=Markets",
   ],
   // CN preset: Sina Finance RSS endpoints (stable public RSS)
   // Sources: rss.sina.com.cn provides finance RSS feeds.
   cn: [
+    // Chinese (CN) - high update frequency
+    "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
     "https://rss.sina.com.cn/roll/finance/hot_roll.xml",
-    "https://rss.sina.com.cn/finance/fund.xml",
-    "https://rss.sina.com.cn/finance/stock.xml",
-    "https://rss.sina.com.cn/finance/industry.xml",
-    "https://rss.sina.com.cn/finance/financial.xml",
-    "https://rss.sina.com.cn/bn/finance.xml",
+    "http://rss.sina.com.cn/finance/stock.xml",
+    "http://rss.sina.com.cn/finance/fund.xml",
+    "http://rss.sina.com.cn/finance/industry.xml",
+    "http://www.xinhuanet.com/finance/news_finance.xml",
   ],
-    mixed: [
-    // English (4) - faster global market news
-    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-    "https://www.cnbc.com/id/100003114/device/rss/rss.html",
-    "http://feeds.bbci.co.uk/news/business/rss.xml",
-    "https://www.marketwatch.com/rss/topstories",
+      mixed: [
+    // English (4) - more China-friendly (often accessible) market/macro feeds
+    "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-US&gl=US&ceid=US:en",
+    "https://www.investing.com/rss/news_25.rss",
+    "https://www.fxstreet.com/rss/news",
+    "https://www.nasdaq.com/feed/rssoutbound?category=Markets",
     // Chinese (4) - domestic policy & market coverage
+    "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
     "https://rss.sina.com.cn/roll/finance/hot_roll.xml",
-    "https://rss.sina.com.cn/finance/stock.xml",
-    "https://rss.sina.com.cn/finance/fund.xml",
-    "https://rss.sina.com.cn/finance/industry.xml",
+    "http://rss.sina.com.cn/finance/stock.xml",
+    "http://www.xinhuanet.com/finance/news_finance.xml",
   ],
 };
 
@@ -966,6 +969,7 @@ function guessSentiment(title, summary) {
 }
 
 app.post("/api/news/rss", async (req, res) => {
+  const feedDebug = [];
   const kwZh = String(req.body?.kwZh || "");
   const kwEn = String(req.body?.kwEn || "");
   const preset = String(req.body?.preset || "mixed");
@@ -990,6 +994,8 @@ app.post("/api/news/rss", async (req, res) => {
   const curYear = new Date().getFullYear();
 
   for (const url of feeds) {
+    const t0 = Date.now();
+    let dbg = { url, ok:false, status:null, items_in:0, items_kept:0, err:null, ms:0 };
     try {
       const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
       if (!r.ok) continue;
