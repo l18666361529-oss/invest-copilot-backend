@@ -925,6 +925,38 @@ function extractYear(s) {
   return Number.isFinite(y) ? y : null;
 }
 
+function inferDateMs(s){
+  // Try to infer a date from strings like:
+  // 2026-01-18, 2026/01/18, 2026.01.18, /2026/01/18/, 20260118
+  const str = String(s||"");
+  // yyyy-mm-dd / yyyy/mm/dd / yyyy.mm.dd
+  let m = str.match(/(20\d{2})[\-\/\.](0?\d{1,2})[\-\/\.](0?\d{1,2})/);
+  if (m){
+    const y = +m[1], mo = +m[2]-1, d = +m[3];
+    const dt = new Date(Date.UTC(y, mo, d, 0, 0, 0));
+    const t = dt.getTime();
+    if (!isNaN(t)) return t;
+  }
+  // /yyyy/mm/dd/
+  m = str.match(/\/(20\d{2})\/(0?\d{1,2})\/(0?\d{1,2})\//);
+  if (m){
+    const y = +m[1], mo = +m[2]-1, d = +m[3];
+    const dt = new Date(Date.UTC(y, mo, d, 0, 0, 0));
+    const t = dt.getTime();
+    if (!isNaN(t)) return t;
+  }
+  // yyyymmdd
+  m = str.match(/\b(20\d{2})(0\d|1[0-2])(0\d|[12]\d|3[01])\b/);
+  if (m){
+    const y = +m[1], mo = +m[2]-1, d = +m[3];
+    const dt = new Date(Date.UTC(y, mo, d, 0, 0, 0));
+    const t = dt.getTime();
+    if (!isNaN(t)) return t;
+  }
+  return null;
+}
+
+
 function toIsoDate(ts) {
   try {
     return new Date(ts).toISOString().slice(0, 10);
@@ -998,19 +1030,22 @@ app.post("/api/news/rss", async (req, res) => {
     let dbg = { url, ok:false, status:null, items_in:0, items_kept:0, err:null, ms:0 };
     try {
       const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
-      if (!r.ok) continue;
+      dbg.status = r.status;
+      if (!r.ok) { dbg.err = `http_status_${r.status}`; dbg.ms = Date.now()-t0; feedDebug.push(dbg); continue; }
       const xml = await r.text();
       const parsed = parseRssOrAtom(xml);
 
       for (const it of parsed) {
         // Filter out very old items (RSS sources sometimes include stale entries)
-        const ts = parseDateMs(it.pubDate);
-        if (ts && ts < cutoffMs) continue;
+        let ts = parseDateMs(it.pubDate);
         if (!ts) {
-          // Heuristic: if we can see an explicit year in link/title/pubDate and it's not this year, drop it.
-          const y = extractYear(it.pubDate) || extractYear(it.link) || extractYear(it.title);
-          if (y && y < curYear) continue;
+          // Try to infer date from link/title when pubDate is missing or unparseable
+          ts = inferDateMs(it.link) || inferDateMs(it.title) || inferDateMs(it.pubDate);
         }
+        if (ts && ts < cutoffMs) continue;
+
+        // If still unknown date, drop (prevents "old but undated" items leaking in)
+        if (!ts) continue;
 
         const key = (it.link || it.title || "").slice(0, 240);
         if (!key || seen.has(key)) continue;
