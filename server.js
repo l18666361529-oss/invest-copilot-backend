@@ -913,8 +913,59 @@ function includesAny(text, kws) {
 function parseDateMs(s) {
   const raw = String(s || "").trim();
   if (!raw) return null;
+  // 1) Native parse (RFC822/ISO etc.)
   const d = new Date(raw);
-  if (!isNaN(d.getTime())) return d.getTime();
+  const t = d.getTime();
+  if (!Number.isNaN(t)) return t;
+
+  // 2) YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
+  let m = raw.match(/(19|20)\d{2}[-\/.](0?[1-9]|1[0-2])[-\/.](0?[1-9]|[12]\d|3[01])/);
+  if (m) {
+    const parts = m[0].split(/[-\/.]/).map(Number);
+    if (parts.length === 3 && parts[0] && parts[1] && parts[2]) {
+      return Date.UTC(parts[0], parts[1] - 1, parts[2]);
+    }
+  }
+
+  // 3) YYYYMMDD
+  m = raw.match(/(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])/);
+  if (m) {
+    const s = m[0];
+    const y = Number(s.slice(0,4));
+    const mo = Number(s.slice(4,6));
+    const da = Number(s.slice(6,8));
+    if (y && mo && da) return Date.UTC(y, mo-1, da);
+  }
+
+  // 4) Chinese date: 2026年1月18日
+  m = raw.match(/(19|20)\d{2}年(0?[1-9]|1[0-2])月(0?[1-9]|[12]\d|3[01])日/);
+  if (m) {
+    const y = Number(m[0].match(/(19|20)\d{2}/)[0]);
+    const mo = Number(m[0].match(/年(\d{1,2})月/)[1]);
+    const da = Number(m[0].match(/月(\d{1,2})日/)[1]);
+    if (y && mo && da) return Date.UTC(y, mo-1, da);
+  }
+
+  return null;
+}
+
+function inferDateMsFromText(...parts) {
+  for (const p of parts) {
+    const raw = String(p || "").trim();
+    if (!raw) continue;
+    const t = parseDateMs(raw);
+    if (t) return t;
+    const m = raw.match(/(19|20)\d{2}[-\/.](0?[1-9]|1[0-2])[-\/.](0?[1-9]|[12]\d|3[01])/);
+    if (m) {
+      const t2 = parseDateMs(m[0]);
+      if (t2) return t2;
+    }
+    const m2 = raw.match(/(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])/);
+    if (m2) {
+      const t3 = parseDateMs(m2[0]);
+      if (t3) return t3;
+    }
+  }
   return null;
 }
 
@@ -924,38 +975,6 @@ function extractYear(s) {
   const y = Number(m[0]);
   return Number.isFinite(y) ? y : null;
 }
-
-function inferDateMs(s){
-  // Try to infer a date from strings like:
-  // 2026-01-18, 2026/01/18, 2026.01.18, /2026/01/18/, 20260118
-  const str = String(s||"");
-  // yyyy-mm-dd / yyyy/mm/dd / yyyy.mm.dd
-  let m = str.match(/(20\d{2})[\-\/\.](0?\d{1,2})[\-\/\.](0?\d{1,2})/);
-  if (m){
-    const y = +m[1], mo = +m[2]-1, d = +m[3];
-    const dt = new Date(Date.UTC(y, mo, d, 0, 0, 0));
-    const t = dt.getTime();
-    if (!isNaN(t)) return t;
-  }
-  // /yyyy/mm/dd/
-  m = str.match(/\/(20\d{2})\/(0?\d{1,2})\/(0?\d{1,2})\//);
-  if (m){
-    const y = +m[1], mo = +m[2]-1, d = +m[3];
-    const dt = new Date(Date.UTC(y, mo, d, 0, 0, 0));
-    const t = dt.getTime();
-    if (!isNaN(t)) return t;
-  }
-  // yyyymmdd
-  m = str.match(/\b(20\d{2})(0\d|1[0-2])(0\d|[12]\d|3[01])\b/);
-  if (m){
-    const y = +m[1], mo = +m[2]-1, d = +m[3];
-    const dt = new Date(Date.UTC(y, mo, d, 0, 0, 0));
-    const t = dt.getTime();
-    if (!isNaN(t)) return t;
-  }
-  return null;
-}
-
 
 function toIsoDate(ts) {
   try {
@@ -1004,11 +1023,11 @@ app.post("/api/news/rss", async (req, res) => {
   const feedDebug = [];
   const kwZh = String(req.body?.kwZh || "");
   const kwEn = String(req.body?.kwEn || "");
-  const preset = String(req.body?.preset || "mixed");
+  const preset = String(req.body?.preset || req.body?.source || "mixed");
   const limit = Math.max(5, Math.min(50, Number(req.body?.limit || 18)));
   // Only keep recent items (default: last 7 days)
   const days = Math.max(1, Math.min(30, Number(req.body?.days || 7)));
-  const customRss = Array.isArray(req.body?.customRss) ? req.body.customRss : [];
+  const customRss = Array.isArray(req.body?.customRss) ? req.body.customRss : (Array.isArray(req.body?.rss) ? req.body.rss : []);
 
   const kws = splitKeywords(kwZh).concat(splitKeywords(kwEn)).map((x) => x.toLowerCase());
   const rssList =
@@ -1029,23 +1048,33 @@ app.post("/api/news/rss", async (req, res) => {
     const t0 = Date.now();
     let dbg = { url, ok:false, status:null, items_in:0, items_kept:0, err:null, ms:0 };
     try {
-      const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+      const r = await fetchWithTimeout(url, { timeoutMs: 20000, headers: { "User-Agent": "Mozilla/5.0" } });
       dbg.status = r.status;
-      if (!r.ok) { dbg.err = `http_status_${r.status}`; dbg.ms = Date.now()-t0; feedDebug.push(dbg); continue; }
+      if (!r.ok) {
+        dbg.err = `http_status_${r.status}`;
+        dbg.ms = Date.now() - t0;
+        feedDebug.push(dbg);
+        continue;
+      }
       const xml = await r.text();
-      const parsed = parseRssOrAtom(xml);
+      let parsed;
+      try { parsed = parseRssOrAtom(xml); } catch (e) {
+        dbg.err = `parse_error_${String(e?.message || e).slice(0,120)}`;
+        dbg.ms = Date.now() - t0;
+        feedDebug.push(dbg);
+        continue;
+      }
+      dbg.ok = true;
+      dbg.items_in = Array.isArray(parsed) ? parsed.length : 0;
+      const beforeLen = all.length;
 
       for (const it of parsed) {
         // Filter out very old items (RSS sources sometimes include stale entries)
         let ts = parseDateMs(it.pubDate);
-        if (!ts) {
-          // Try to infer date from link/title when pubDate is missing or unparseable
-          ts = inferDateMs(it.link) || inferDateMs(it.title) || inferDateMs(it.pubDate);
-        }
-        if (ts && ts < cutoffMs) continue;
-
-        // If still unknown date, drop (prevents "old but undated" items leaking in)
+        if (!ts) ts = inferDateMsFromText(it.pubDate, it.link, it.title);
+        // If we cannot determine the date, drop it to avoid stale/undated items polluting the list.
         if (!ts) continue;
+        if (ts < cutoffMs) continue;
 
         const key = (it.link || it.title || "").slice(0, 240);
         if (!key || seen.has(key)) continue;
@@ -1054,7 +1083,7 @@ app.post("/api/news/rss", async (req, res) => {
         const item = {
           title: it.title,
           link: it.link,
-          pubDate: ts ? toIsoDate(ts) : it.pubDate,
+          pubDate: toIsoDate(ts),
           ts: ts || null,
           source: url.replace(/^https?:\/\//, "").split("/")[0],
           summary: it.summary,
