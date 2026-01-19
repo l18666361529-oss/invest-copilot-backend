@@ -352,65 +352,85 @@ async function fetchMarketHistoryStooq(symbol, days = 160) {
 async function fetchMarketHistory(symbol, days = 140) {
   const sym = normTicker(symbol);
   if (!sym) return { ok: false, reason: "empty symbol" };
-  // 如果没有 AlphaVantage Key：先用 Yahoo（更全），再降级 Stooq
-  if (!AV_KEY) {
-    const yh = await fetchMarketHistoryYahoo(sym, days);
-    if (yh.ok) return yh;
-    return await fetchMarketHistoryStooq(sym, days);
-  }
 
-  const cacheKey = `av:${sym}:${days}`;
+  // Prefer cache
+  const cacheKey = `hist:${sym}:${days}`;
   const cached = cacheGet(cacheKey);
   if (cached) return cached;
 
+  // Helper: fallback chain
+  async function fallbackChain(reason) {
+    // Yahoo first (usually best coverage), then Stooq.
+    const yh = await fetchMarketHistoryYahoo(sym, Math.max(days, 160));
+    if (yh.ok) return yh;
+    const st = await fetchMarketHistoryStooq(sym, Math.max(days, 160));
+    if (st.ok) return st;
+    return { ok: false, reason: reason || "no data", debug: { yahoo: yh, stooq: st } };
+  }
+
+  // If no AlphaVantage key, go straight to fallback.
+  if (!AV_KEY) {
+    const fb = await fallbackChain("missing ALPHAVANTAGE_KEY");
+    cacheSet(cacheKey, fb, 2 * 60 * 1000);
+    return fb;
+  }
+
+  // AlphaVantage daily adjusted
   const url = `https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol=${encodeURIComponent(sym)}&outputsize=compact&apikey=${encodeURIComponent(AV_KEY)}`;
-  const r = await fetchWithTimeout(url, { timeoutMs: 25000 });
-  if (!r.ok) {
-    const data = { ok: false, reason: `alphavantage status=${r.status}` };
-    cacheSet(cacheKey, data, 2 * 60 * 1000);
+  try {
+    const r = await fetchWithTimeout(url, { timeoutMs: 20000, headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!r.ok) {
+      const fb = await fallbackChain(`alphavantage http ${r.status}`);
+      cacheSet(cacheKey, fb, 2 * 60 * 1000);
+      return fb;
+    }
+    const j = await r.json();
+
+    const note = j?.Note || j?.Information;
+    if (note) {
+      const fb = await fallbackChain("alphavantage rate limit / info");
+      // If fallback works, use it; else return AV note for debugging.
+      if (fb.ok) {
+        cacheSet(cacheKey, fb, 2 * 60 * 1000);
+        return fb;
+      }
+      const data = { ok: false, reason: "alphavantage rate limit / info", debug: note };
+      cacheSet(cacheKey, data, 60 * 1000);
+      return data;
+    }
+
+    const ts = j?.["Time Series (Daily)"];
+    if (!ts || typeof ts !== "object") {
+      const fb = await fallbackChain("alphavantage missing time series");
+      cacheSet(cacheKey, fb, 2 * 60 * 1000);
+      return fb;
+    }
+
+    const series = [];
+    for (const [date, row] of Object.entries(ts)) {
+      const close = toNum(row?.["4. close"] ?? row?.["5. adjusted close"]);
+      if (!date || close == null) continue;
+      series.push({ date, close });
+    }
+    series.sort((a, b) => a.date.localeCompare(b.date));
+
+    if (series.length < 60) {
+      const fb = await fallbackChain("alphavantage insufficient history");
+      cacheSet(cacheKey, fb, 2 * 60 * 1000);
+      return fb;
+    }
+
+    const trimmed = series.slice(-Math.max(days, 160));
+    const data = { ok: true, source: "alphavantage", series: trimmed };
+    cacheSet(cacheKey, data, 10 * 60 * 1000);
     return data;
+  } catch (e) {
+    const fb = await fallbackChain(`alphavantage fetch error`);
+    cacheSet(cacheKey, fb, 2 * 60 * 1000);
+    return fb;
   }
-  const j = await r.json();
-
-  const note = j?.Note || j?.Information;
-  if (note) {
-    // 触发限流时：先用 Yahoo，再降级 Stooq
-    const yh = await fetchMarketHistoryYahoo(sym, days);
-    if (yh.ok) return yh;
-    const yh = await fetchMarketHistoryYahoo(sym, days);
-    if (yh.ok) return yh;
-    const fb = await fetchMarketHistoryStooq(sym, days);
-    if (fb.ok) return fb;
-    const data = { ok: false, reason: "alphavantage rate limit / info", debug: note };
-    cacheSet(cacheKey, data, 60 * 1000);
-    return data;
-  }
-
-  const ts = j["Time Series (Daily)"] || j["Time Series (Daily Adjusted)"];
-  if (!ts || typeof ts !== "object") {
-    const yh = await fetchMarketHistoryYahoo(sym, days);
-    if (yh.ok) return yh;
-    const fb = await fetchMarketHistoryStooq(sym, days);
-    if (fb.ok) return fb;
-    const data = { ok: false, reason: "alphavantage missing time series", debug: j };
-    cacheSet(cacheKey, data, 2 * 60 * 1000);
-    return data;
-  }
-
-  const dates = Object.keys(ts).sort();
-  const series = [];
-  for (const d of dates) {
-    const row = ts[d];
-    const close = toNum(row?.["5. adjusted close"] ?? row?.["4. close"]);
-    if (close == null) continue;
-    series.push({ date: d, close });
-  }
-
-  const trimmed = series.slice(-days);
-  const data = { ok: true, source: "alphavantage", series: trimmed };
-  cacheSet(cacheKey, data, 10 * 60 * 1000);
-  return data;
 }
+
 
 
 /* =========================
@@ -564,8 +584,6 @@ async function fetchUsQuote(symbol) {
   const note = j?.Note || j?.Information;
   if (note) {
     // 触发限流时：先用 Yahoo，再降级 Stooq
-    const yh = await fetchMarketHistoryYahoo(sym, days);
-    if (yh.ok) return yh;
     const yh = await fetchMarketHistoryYahoo(sym, days);
     if (yh.ok) return yh;
     const fb = await fetchMarketHistoryStooq(sym, days);
@@ -913,59 +931,8 @@ function includesAny(text, kws) {
 function parseDateMs(s) {
   const raw = String(s || "").trim();
   if (!raw) return null;
-  // 1) Native parse (RFC822/ISO etc.)
   const d = new Date(raw);
-  const t = d.getTime();
-  if (!Number.isNaN(t)) return t;
-
-  // 2) YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
-  let m = raw.match(/(19|20)\d{2}[-\/.](0?[1-9]|1[0-2])[-\/.](0?[1-9]|[12]\d|3[01])/);
-  if (m) {
-    const parts = m[0].split(/[-\/.]/).map(Number);
-    if (parts.length === 3 && parts[0] && parts[1] && parts[2]) {
-      return Date.UTC(parts[0], parts[1] - 1, parts[2]);
-    }
-  }
-
-  // 3) YYYYMMDD
-  m = raw.match(/(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])/);
-  if (m) {
-    const s = m[0];
-    const y = Number(s.slice(0,4));
-    const mo = Number(s.slice(4,6));
-    const da = Number(s.slice(6,8));
-    if (y && mo && da) return Date.UTC(y, mo-1, da);
-  }
-
-  // 4) Chinese date: 2026年1月18日
-  m = raw.match(/(19|20)\d{2}年(0?[1-9]|1[0-2])月(0?[1-9]|[12]\d|3[01])日/);
-  if (m) {
-    const y = Number(m[0].match(/(19|20)\d{2}/)[0]);
-    const mo = Number(m[0].match(/年(\d{1,2})月/)[1]);
-    const da = Number(m[0].match(/月(\d{1,2})日/)[1]);
-    if (y && mo && da) return Date.UTC(y, mo-1, da);
-  }
-
-  return null;
-}
-
-function inferDateMsFromText(...parts) {
-  for (const p of parts) {
-    const raw = String(p || "").trim();
-    if (!raw) continue;
-    const t = parseDateMs(raw);
-    if (t) return t;
-    const m = raw.match(/(19|20)\d{2}[-\/.](0?[1-9]|1[0-2])[-\/.](0?[1-9]|[12]\d|3[01])/);
-    if (m) {
-      const t2 = parseDateMs(m[0]);
-      if (t2) return t2;
-    }
-    const m2 = raw.match(/(19|20)\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])/);
-    if (m2) {
-      const t3 = parseDateMs(m2[0]);
-      if (t3) return t3;
-    }
-  }
+  if (!isNaN(d.getTime())) return d.getTime();
   return null;
 }
 
@@ -1023,11 +990,11 @@ app.post("/api/news/rss", async (req, res) => {
   const feedDebug = [];
   const kwZh = String(req.body?.kwZh || "");
   const kwEn = String(req.body?.kwEn || "");
-  const preset = String(req.body?.preset || req.body?.source || "mixed");
+  const preset = String(req.body?.preset || "mixed");
   const limit = Math.max(5, Math.min(50, Number(req.body?.limit || 18)));
   // Only keep recent items (default: last 7 days)
   const days = Math.max(1, Math.min(30, Number(req.body?.days || 7)));
-  const customRss = Array.isArray(req.body?.customRss) ? req.body.customRss : (Array.isArray(req.body?.rss) ? req.body.rss : []);
+  const customRss = Array.isArray(req.body?.customRss) ? req.body.customRss : [];
 
   const kws = splitKeywords(kwZh).concat(splitKeywords(kwEn)).map((x) => x.toLowerCase());
   const rssList =
@@ -1048,33 +1015,20 @@ app.post("/api/news/rss", async (req, res) => {
     const t0 = Date.now();
     let dbg = { url, ok:false, status:null, items_in:0, items_kept:0, err:null, ms:0 };
     try {
-      const r = await fetchWithTimeout(url, { timeoutMs: 20000, headers: { "User-Agent": "Mozilla/5.0" } });
-      dbg.status = r.status;
-      if (!r.ok) {
-        dbg.err = `http_status_${r.status}`;
-        dbg.ms = Date.now() - t0;
-        feedDebug.push(dbg);
-        continue;
-      }
+      const r = await fetchWithTimeout(url, { timeoutMs: 20000 });
+      if (!r.ok) continue;
       const xml = await r.text();
-      let parsed;
-      try { parsed = parseRssOrAtom(xml); } catch (e) {
-        dbg.err = `parse_error_${String(e?.message || e).slice(0,120)}`;
-        dbg.ms = Date.now() - t0;
-        feedDebug.push(dbg);
-        continue;
-      }
-      dbg.ok = true;
-      dbg.items_in = Array.isArray(parsed) ? parsed.length : 0;
-      const beforeLen = all.length;
+      const parsed = parseRssOrAtom(xml);
 
       for (const it of parsed) {
         // Filter out very old items (RSS sources sometimes include stale entries)
-        let ts = parseDateMs(it.pubDate);
-        if (!ts) ts = inferDateMsFromText(it.pubDate, it.link, it.title);
-        // If we cannot determine the date, drop it to avoid stale/undated items polluting the list.
-        if (!ts) continue;
-        if (ts < cutoffMs) continue;
+        const ts = parseDateMs(it.pubDate);
+        if (ts && ts < cutoffMs) continue;
+        if (!ts) {
+          // Heuristic: if we can see an explicit year in link/title/pubDate and it's not this year, drop it.
+          const y = extractYear(it.pubDate) || extractYear(it.link) || extractYear(it.title);
+          if (y && y < curYear) continue;
+        }
 
         const key = (it.link || it.title || "").slice(0, 240);
         if (!key || seen.has(key)) continue;
@@ -1083,7 +1037,7 @@ app.post("/api/news/rss", async (req, res) => {
         const item = {
           title: it.title,
           link: it.link,
-          pubDate: toIsoDate(ts),
+          pubDate: ts ? toIsoDate(ts) : it.pubDate,
           ts: ts || null,
           source: url.replace(/^https?:\/\//, "").split("/")[0],
           summary: it.summary,
