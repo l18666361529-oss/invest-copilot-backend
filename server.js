@@ -632,9 +632,9 @@ app.post("/api/quote/batch", async (req, res) => {
     const code = String(p.code || "").trim();
     if (!code) continue;
 
-    const isCn = type === "CN_FUND" || /^\d{6}$/.test(code);
+    const isCn = type === "CN_FUND" || /^\d{1,6}$/.test(code);
     if (isCn) {
-      const q = await fetchCnFundQuote(code, force);
+      const q = await fetchCnFundQuote(normFundCode(code), force);
       if (!q.ok) {
         items.push({ ok: false, code: normFundCode(code), reason: q.reason || "cn quote failed" });
       } else {
@@ -666,7 +666,7 @@ app.post("/api/meta/resolve", async (req, res) => {
   if (!codeRaw) return res.status(400).json({ ok: false, error: "code required" });
 
   // CN fund/ETF: from Eastmoney pingzhongdata
-  if (type === "CN_FUND" || /^\d{6}$/.test(codeRaw)) {
+  if (type === "CN_FUND" || /^\d{1,6}$/.test(codeRaw)) {
     const code = normFundCode(codeRaw);
     const jsRes = await fetchCnFundJs(code);
     if (!jsRes.ok) return res.json({ ok: false, error: jsRes.reason || "eastmoney fetch failed" });
@@ -716,7 +716,7 @@ app.post("/api/tech/batch", async (req, res) => {
     const codeRaw = String(p.code || "").trim();
     if (!codeRaw) continue;
 
-    const isCn = type === "CN_FUND" || /^\d{6}$/.test(codeRaw);
+    const isCn = type === "CN_FUND" || /^\d{1,6}$/.test(codeRaw);
     if (isCn) {
       const fund = normFundCode(codeRaw);
       const hist = await fetchCnFundHistory(fund, 200);
