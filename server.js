@@ -493,7 +493,8 @@ async function fetchCnFundOfficialNav(code, force=false) {
   cacheSet(cacheKey, data, 30 * 1000);
   return data;
 }
-async function fetchCnFundQuote(code, force = false) {
+
+async function fetchCnFundQuote(code, force=false) {
   const fund = normFundCode(code);
   if (!fund) return { ok: false, reason: "empty code" };
 
@@ -503,23 +504,25 @@ async function fetchCnFundQuote(code, force = false) {
     if (cached) return cached;
   }
 
-  // 统一输出结构：即使 fundgz 失败，也尽量返回 officialNav 来保证“市值可算”
+  // Output shape is stable for frontend:
+  // - nav/navDate always tries to exist (official fallback)
+  // - est/estTime may be null for some QDII
   const out = {
     ok: false,
     code: fund,
     source: "fundgz",
     name: "",
     navDate: "",
-    nav: null,        // dwjz
-    est: null,        // gsz
-    estChangePct: null, // gszzl
+    nav: null,            // latest published NAV (dwjz)
+    est: null,            // intraday estimate (gsz) - may be null for QDII
+    estChangePct: null,   // gszzl
     estTime: "",
     officialNav: null,
     officialNavDate: "",
     officialSource: ""
   };
 
-  // 1) 先尝试 fundgz（盘中估值/可能为空）
+  // 1) Try fundgz (JSONP). For some QDII, gsz might be empty; dwjz still useful.
   try {
     const url = `https://fundgz.1234567.com.cn/js/${encodeURIComponent(fund)}.js?rt=${Date.now()}`;
     const r = await fetchWithTimeout(url, {
@@ -532,67 +535,54 @@ async function fetchCnFundQuote(code, force = false) {
 
     if (r.ok) {
       const txt = await r.text();
-      const m = txt.match(/jsonpgz\((\{[\s\S]*\})\)\s*;?\s*$/);
+      const m = txt.match(/jsonpgz\((\{[\s\S]*\})\)\s*;?\s*$/i);
       if (m && m[1]) {
         const j = JSON.parse(m[1]);
-        out.ok = true;                 // 注意：fundgz 成功不代表一定有 est，但至少有 nav/date
+        out.ok = true;
         out.source = "fundgz";
         out.name = (j.name || "").trim();
         out.navDate = (j.jzrq || "").trim();
-        out.nav = toNum(j.dwjz);       // 最新净值
-        out.est = toNum(j.gsz);        // 盘中估值（QDII 很可能为空）
+        out.nav = toNum(j.dwjz);
+        out.est = toNum(j.gsz);
         out.estChangePct = toNum(j.gszzl);
         out.estTime = (j.gztime || "").trim();
-      } else {
-        // fundgz 返回格式异常
-        out.ok = false;
-        out.source = "fundgz";
       }
-    } else {
-      out.ok = false;
-      out.source = "fundgz";
     }
-  } catch {
-    out.ok = false;
-    out.source = "fundgz";
+  } catch (e) {
+    // ignore and fallback
   }
 
-  // 2) 无论 fundgz 是否成功，都用 Eastmoney F10 兜底拿“已公布最新净值”
+  // 2) Always fallback to official NAV (Eastmoney F10) to guarantee "market value can be computed"
   try {
     const off = await fetchCnFundOfficialNav(fund, force);
     if (off && off.ok) {
-      out.officialNav = off.nav;
-      out.officialNavDate = off.navDate;
+      out.officialNav = off.nav ?? null;
+      out.officialNavDate = (off.navDate || "").trim();
       out.officialSource = off.source || "eastmoney_f10";
+      if (!out.name && off.name) out.name = off.name;
 
-      // 如果 fundgz 没拿到净值/日期，或者官方日期更新，就用官方覆盖 nav/navDate
-      if (!out.navDate || (off.navDate && off.navDate > out.navDate)) {
-        out.navDate = off.navDate || out.navDate;
-        if (off.nav != null) out.nav = off.nav;
+      // Prefer the fresher official NAV if it is newer than fundgz navDate
+      if (!out.navDate || (out.officialNavDate && out.officialNavDate > out.navDate)) {
+        out.navDate = out.officialNavDate || out.navDate;
+        if (out.officialNav != null) out.nav = out.officialNav;
       }
 
-      // 如果 fundgz 完全失败，但 official 有数据：也要返回 ok=true，保证前端能算市值
+      // If fundgz failed but official NAV exists, still consider ok=true
+      if (out.nav != null) out.ok = true;
       if (!out.ok && out.nav != null) {
         out.ok = true;
-        out.source = out.officialSource; // 用官方净值兜底
+        out.source = out.officialSource;
       }
-
-      // 名称兜底（有些 fundgz 获取不到 name）
-      if (!out.name && off.name) out.name = off.name;
     }
-  } catch {
+  } catch (e) {
     // ignore
   }
 
-  // 最终：只要 nav 有值，就算 ok=true（市值可算）
+  // Final: if we have nav, make it ok
   if (out.nav != null) out.ok = true;
 
   cacheSet(cacheKey, out, 30 * 1000);
   return out;
-}
-
-  cacheSet(cacheKey, data, 20 * 1000);
-  return data;
 }
 
 async function fetchUsQuote(symbol) {
@@ -670,7 +660,7 @@ app.post("/api/quote/batch", async (req, res) => {
 
     const isCn = type === "CN_FUND" || /^\d{1,6}$/.test(code);
     if (isCn) {
-      const q = await fetchCnFundQuote(normFundCode(code), force);
+      const q = await fetchCnFundQuote(code, force);
       if (!q.ok) {
         items.push({ ok: false, code: normFundCode(code), reason: q.reason || "cn quote failed" });
       } else {
@@ -702,7 +692,7 @@ app.post("/api/meta/resolve", async (req, res) => {
   if (!codeRaw) return res.status(400).json({ ok: false, error: "code required" });
 
   // CN fund/ETF: from Eastmoney pingzhongdata
-  if (type === "CN_FUND" || /^\d{1,6}$/.test(codeRaw)) {
+  if (type === "CN_FUND" || /^\d{6}$/.test(codeRaw)) {
     const code = normFundCode(codeRaw);
     const jsRes = await fetchCnFundJs(code);
     if (!jsRes.ok) return res.json({ ok: false, error: jsRes.reason || "eastmoney fetch failed" });
@@ -752,7 +742,7 @@ app.post("/api/tech/batch", async (req, res) => {
     const codeRaw = String(p.code || "").trim();
     if (!codeRaw) continue;
 
-    const isCn = type === "CN_FUND" || /^\d{1,6}$/.test(codeRaw);
+    const isCn = type === "CN_FUND" || /^\d{6}$/.test(codeRaw);
     if (isCn) {
       const fund = normFundCode(codeRaw);
       const hist = await fetchCnFundHistory(fund, 200);
