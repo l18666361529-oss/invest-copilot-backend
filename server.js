@@ -13,6 +13,15 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "6mb" }));
 
+// Request logger (status + duration)
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    console.log(`[REQ] ${req.method} ${req.originalUrl} -> ${res.statusCode} ${Date.now() - start}ms`);
+  });
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 const BUILD_ID = new Date().toISOString();
 const TZ = process.env.TZ || "Asia/Shanghai";
@@ -643,6 +652,7 @@ async function fetchUsQuote(symbol) {
 ========================= */
 app.get("/health", (req, res) => {
   res.json({ ok: true, build: BUILD_ID, tz: TZ, av_key: AV_KEY ? "set" : "missing" });
+});
 
 /* =========================
    Quote batch (for refresh NAV/price)
@@ -678,8 +688,6 @@ app.post("/api/quote/batch", async (req, res) => {
   }
 
   res.json({ ok: true, build: BUILD_ID, items });
-});
-
 });
 
 /* =========================
@@ -1152,7 +1160,7 @@ app.post("/api/ai/chat", async (req, res) => {
 
   try {
     const r = await fetchWithTimeout(endpoint, {
-      timeoutMs: 45000,
+      timeoutMs: 120000,
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -1166,9 +1174,18 @@ app.post("/api/ai/chat", async (req, res) => {
     });
 
     const text = await r.text();
+    if (!r.ok) {
+      console.error(`[AI_CHAT_UPSTREAM] status=${r.status} body=${text.slice(0, 800)}`);
+    }
     res.status(r.status).send(text);
   } catch (e) {
-    res.status(500).json({ ok: false, error: e?.message || String(e) });
+    const msg = e?.message || String(e);
+    const name = e?.name || "";
+    console.error("[AI_CHAT_ERROR]", e?.stack || e);
+    if (name === "AbortError" || /aborted/i.test(msg)) {
+      return res.status(504).json({ ok: false, error: "Upstream timeout/aborted", hint: "Try increasing timeout or use a faster/cheaper model" });
+    }
+    return res.status(500).json({ ok: false, error: msg });
   }
 });
 
