@@ -493,67 +493,103 @@ async function fetchCnFundOfficialNav(code, force=false) {
   cacheSet(cacheKey, data, 30 * 1000);
   return data;
 }
-
-async function fetchCnFundQuote(code, force=false) {
+async function fetchCnFundQuote(code, force = false) {
   const fund = normFundCode(code);
   if (!fund) return { ok: false, reason: "empty code" };
 
-  const cacheKey = `fundgz:${fund}`;
+  const cacheKey = `fundquote:${fund}`;
   if (!force) {
     const cached = cacheGet(cacheKey);
     if (cached) return cached;
   }
 
-  // fundgz returns JSONP: jsonpgz({...});
-  const url = `https://fundgz.1234567.com.cn/js/${encodeURIComponent(fund)}.js?rt=${Date.now()}`;
-  const r = await fetchWithTimeout(url, { timeoutMs: 15000 });
-  if (!r.ok) {
-    const data = { ok: false, reason: `fundgz status=${r.status}` };
-    cacheSet(cacheKey, data, 30 * 1000);
-    return data;
-  }
-  const txt = await r.text();
-  const m = txt.match(/jsonpgz\((\{[\s\S]*\})\)\s*;?/i);
-  if (!m) {
-    const data = { ok: false, reason: "fundgz parse failed" };
-    cacheSet(cacheKey, data, 30 * 1000);
-    return data;
-  }
-  let j = null;
-  try { j = JSON.parse(m[1]); } catch {
-    const data = { ok: false, reason: "fundgz json parse failed" };
-    cacheSet(cacheKey, data, 30 * 1000);
-    return data;
-  }
-
-  const data = {
-    ok: true,
+  // 统一输出结构：即使 fundgz 失败，也尽量返回 officialNav 来保证“市值可算”
+  const out = {
+    ok: false,
     code: fund,
-    name: (j.name || "").trim(),
-    navDate: (j.jzrq || "").trim(),     // 净值日期
-    nav: toNum(j.dwjz),                 // 单位净值
-    est: toNum(j.gsz),                  // 估算净值
-    estPct: toNum(j.gszzl),             // 估算涨跌幅(%)
-    estTime: (j.gztime || "").trim(),   // 估值时间
     source: "fundgz",
+    name: "",
+    navDate: "",
+    nav: null,        // dwjz
+    est: null,        // gsz
+    estChangePct: null, // gszzl
+    estTime: "",
+    officialNav: null,
+    officialNavDate: "",
+    officialSource: ""
   };
 
-  // 同步“官方已公布单位净值”：若 Eastmoney F10 的最新净值日期更新，则用它覆盖 fundgz 的 dwjz/jzrq
+  // 1) 先尝试 fundgz（盘中估值/可能为空）
   try {
-    const off = await fetchCnFundOfficialNav(fund, force);
-    if (off && off.ok && off.navDate) {
-      data.officialNavDate = off.navDate;
-      data.officialNav = off.nav;
-      data.officialSource = off.source;
-      // 如果官方净值日期更“新”，则以官方为准
-      if (data.navDate && off.navDate > data.navDate) {
-        data.navDate = off.navDate;
-        if (off.nav != null) data.nav = off.nav;
+    const url = `https://fundgz.1234567.com.cn/js/${encodeURIComponent(fund)}.js?rt=${Date.now()}`;
+    const r = await fetchWithTimeout(url, {
+      timeoutMs: 20000,
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://fund.eastmoney.com/"
       }
+    });
+
+    if (r.ok) {
+      const txt = await r.text();
+      const m = txt.match(/jsonpgz\((\{[\s\S]*\})\)\s*;?\s*$/);
+      if (m && m[1]) {
+        const j = JSON.parse(m[1]);
+        out.ok = true;                 // 注意：fundgz 成功不代表一定有 est，但至少有 nav/date
+        out.source = "fundgz";
+        out.name = (j.name || "").trim();
+        out.navDate = (j.jzrq || "").trim();
+        out.nav = toNum(j.dwjz);       // 最新净值
+        out.est = toNum(j.gsz);        // 盘中估值（QDII 很可能为空）
+        out.estChangePct = toNum(j.gszzl);
+        out.estTime = (j.gztime || "").trim();
+      } else {
+        // fundgz 返回格式异常
+        out.ok = false;
+        out.source = "fundgz";
+      }
+    } else {
+      out.ok = false;
+      out.source = "fundgz";
     }
   } catch {
-    // ignore official nav errors
+    out.ok = false;
+    out.source = "fundgz";
   }
+
+  // 2) 无论 fundgz 是否成功，都用 Eastmoney F10 兜底拿“已公布最新净值”
+  try {
+    const off = await fetchCnFundOfficialNav(fund, force);
+    if (off && off.ok) {
+      out.officialNav = off.nav;
+      out.officialNavDate = off.navDate;
+      out.officialSource = off.source || "eastmoney_f10";
+
+      // 如果 fundgz 没拿到净值/日期，或者官方日期更新，就用官方覆盖 nav/navDate
+      if (!out.navDate || (off.navDate && off.navDate > out.navDate)) {
+        out.navDate = off.navDate || out.navDate;
+        if (off.nav != null) out.nav = off.nav;
+      }
+
+      // 如果 fundgz 完全失败，但 official 有数据：也要返回 ok=true，保证前端能算市值
+      if (!out.ok && out.nav != null) {
+        out.ok = true;
+        out.source = out.officialSource; // 用官方净值兜底
+      }
+
+      // 名称兜底（有些 fundgz 获取不到 name）
+      if (!out.name && off.name) out.name = off.name;
+    }
+  } catch {
+    // ignore
+  }
+
+  // 最终：只要 nav 有值，就算 ok=true（市值可算）
+  if (out.nav != null) out.ok = true;
+
+  cacheSet(cacheKey, out, 30 * 1000);
+  return out;
+}
 
   cacheSet(cacheKey, data, 20 * 1000);
   return data;
