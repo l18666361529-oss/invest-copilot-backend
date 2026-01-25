@@ -10,7 +10,24 @@ import cors from "cors";
  */
 
 const app = express();
-app.use(cors());
+
+// ---- CORS (GitHub Pages -> Render) ----
+// Use explicit options so Firefox/Safari won't report opaque NetworkError on preflight failures.
+const corsOptions = {
+  origin: true, // reflect requesting origin
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  maxAge: 86400,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+// If any proxy/CDN strips OPTIONS handling, ensure we always end preflight cleanly.
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+
 app.use(express.json({ limit: "6mb" }));
 
 // Request logger (status + duration)
