@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import zlib from "zlib";
 
 /**
  * NEON QUANT backend (replacement v4)
@@ -1143,6 +1144,93 @@ function normalizeBaseUrl(baseUrl) {
   return u;
 }
 
+// -------- Upstream response decoding (fix gzip/binary junk) --------
+function isGzipBuffer(buf) {
+  return buf && buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b;
+}
+function isDeflateBuffer(buf) {
+  // Common zlib header bytes for deflate streams (not exhaustive)
+  return buf && buf.length >= 2 && buf[0] === 0x78 && (buf[1] === 0x01 || buf[1] === 0x5e || buf[1] === 0x9c || buf[1] === 0xda);
+}
+async function responseToText(r) {
+  // Always read as bytes first, then attempt to decode (handles missing/incorrect Content-Encoding headers)
+  const ab = await r.arrayBuffer();
+  const buf = Buffer.from(ab);
+  try {
+    if (isGzipBuffer(buf)) return zlib.gunzipSync(buf).toString("utf8");
+    if (isDeflateBuffer(buf)) return zlib.inflateSync(buf).toString("utf8");
+  } catch {}
+  return buf.toString("utf8");
+}
+
+function wrapAsOpenAI(content) {
+  return {
+    choices: [{ message: { role: "assistant", content: String(content || "") } }],
+  };
+}
+
+async function callOpenAICompatChat({ baseUrl, apiKey, model, messages, temperature }) {
+  const endpoint = baseUrl.endsWith("/v1") ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/chat/completions`;
+  const r = await fetchWithTimeout(endpoint, {
+    timeoutMs: 120000,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({ model, messages, temperature }),
+  });
+  const text = await responseToText(r);
+  return { endpoint, r, text };
+}
+
+function toAnthropicMessages(openaiMessages) {
+  // Convert OpenAI-style messages -> Anthropic Messages blocks
+  // Anthropic doesn't accept role=system inside messages (use top-level "system" instead).
+  return (openaiMessages || [])
+    .filter(m => m && m.role && m.role !== "system")
+    .map(m => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: [{ type: "text", text: String(m.content ?? "") }],
+    }));
+}
+
+async function callAnthropicMessages({ baseUrl, apiKey, model, system, openaiMessages }) {
+  const endpoint = baseUrl.endsWith("/v1") ? `${baseUrl}/messages` : `${baseUrl}/v1/messages`;
+
+  const payload = {
+    model,
+    max_tokens: 2048,
+    system: String(system || ""),
+    messages: toAnthropicMessages(openaiMessages),
+  };
+
+  const r = await fetchWithTimeout(endpoint, {
+    timeoutMs: 120000,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const text = await responseToText(r);
+  return { endpoint, r, text };
+}
+
+function looksLikeWrongEndpoint(status, bodyText) {
+  const t = String(bodyText || "").slice(0, 2000);
+  if ([404, 405, 415].includes(status)) return true;
+  if (status === 401) return true; // often header mismatch (Authorization vs x-api-key)
+  if (status === 400 || status === 422) {
+    return /chat\/completions|unknown (endpoint|route)|not found|no route|invalid (url|path)|unrecognized request/i.test(t);
+  }
+  return false;
+}
+
+
 app.post("/api/ai/chat", async (req, res) => {
   const baseUrl = normalizeBaseUrl(req.body?.baseUrl);
   const apiKey = String(req.body?.apiKey || "");
@@ -1153,8 +1241,6 @@ app.post("/api/ai/chat", async (req, res) => {
   const data = req.body?.data || {};
 
   if (!apiKey || !model) return res.status(400).json({ ok: false, error: "apiKey/model required" });
-
-  const endpoint = baseUrl.endsWith("/v1") ? `${baseUrl}/chat/completions` : `${baseUrl}/v1/chat/completions`;
 
   const langHint =
     outLang === "en" ? "Please answer in English." :
@@ -1170,31 +1256,58 @@ app.post("/api/ai/chat", async (req, res) => {
     news: data.news || [],
   };
 
-  const messages = [
+  const openaiMessages = [
     { role: "system", content: SYSTEM_PROMPT },
     { role: "user", content: `${langHint}\n\n[Analysis Prompt]\n${analysisPrompt}\n\n[Task Prompt]\n${taskPrompt}\n\n[Data(JSON)]\n${JSON.stringify(userPayload).slice(0, 180000)}` },
   ];
 
   try {
-    const r = await fetchWithTimeout(endpoint, {
-      timeoutMs: 120000,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.4,
-      }),
+    // 1) Try OpenAI-compatible Chat Completions first
+    const oa = await callOpenAICompatChat({
+      baseUrl,
+      apiKey,
+      model,
+      messages: openaiMessages,
+      temperature: 0.4,
     });
 
-    const text = await r.text();
-    if (!r.ok) {
-      console.error(`[AI_CHAT_UPSTREAM] status=${r.status} body=${text.slice(0, 800)}`);
+    if (oa.r.ok) {
+      return res.status(oa.r.status).send(oa.text);
     }
-    res.status(r.status).send(text);
+
+    console.error(`[AI_CHAT_UPSTREAM_OPENAI] endpoint=${oa.endpoint} status=${oa.r.status} body=${oa.text.slice(0, 800)}`);
+
+    // 2) Fallback to Anthropic Messages format if it looks like a mismatch
+    if (looksLikeWrongEndpoint(oa.r.status, oa.text)) {
+      const an = await callAnthropicMessages({
+        baseUrl,
+        apiKey,
+        model,
+        system: SYSTEM_PROMPT,
+        openaiMessages,
+      });
+
+      if (!an.r.ok) {
+        console.error(`[AI_CHAT_UPSTREAM_ANTHROPIC] endpoint=${an.endpoint} status=${an.r.status} body=${an.text.slice(0, 800)}`);
+        return res.status(oa.r.status).send(oa.text); // keep original failure for transparency
+      }
+
+      // Convert Anthropic -> OpenAI shape (front-end expects choices[0].message.content)
+      let contentText = an.text;
+      try {
+        const j = JSON.parse(an.text);
+        contentText = (j?.content || [])
+          .filter(b => b?.type === "text")
+          .map(b => b?.text || "")
+          .join("\n")
+          .trim() || an.text;
+      } catch {}
+
+      return res.status(200).json(wrapAsOpenAI(contentText));
+    }
+
+    // 3) Otherwise, return the OpenAI-compatible error response as-is
+    return res.status(oa.r.status).send(oa.text);
   } catch (e) {
     const msg = e?.message || String(e);
     const name = e?.name || "";
@@ -1204,6 +1317,7 @@ app.post("/api/ai/chat", async (req, res) => {
     }
     return res.status(500).json({ ok: false, error: msg });
   }
+});
 });
 
 /* =========================
