@@ -1318,7 +1318,6 @@ app.post("/api/ai/chat", async (req, res) => {
     return res.status(500).json({ ok: false, error: msg });
   }
 });
-});
 
 /* =========================
    Start
