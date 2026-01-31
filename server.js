@@ -1141,6 +1141,8 @@ function normalizeBaseUrl(baseUrl) {
   let u = String(baseUrl || "").trim();
   if (!u) return "https://api.openai.com";
   u = u.replace(/\/+$/, "");
+  // Users sometimes paste a full endpoint; normalize back to the host/base.
+  u = u.replace(/\/(v1\/chat\/completions|chat\/completions|v1\/messages|messages)$/i, "");
   return u;
 }
 
@@ -1176,6 +1178,8 @@ async function callOpenAICompatChat({ baseUrl, apiKey, model, messages, temperat
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      // Ask upstream not to compress; still decode defensively in responseToText()
+      "Accept-Encoding": "identity",
       "Authorization": `Bearer ${apiKey}`,
     },
     body: JSON.stringify({ model, messages, temperature }),
@@ -1210,6 +1214,7 @@ async function callAnthropicMessages({ baseUrl, apiKey, model, system, openaiMes
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "Accept-Encoding": "identity",
       "x-api-key": apiKey,
       "anthropic-version": "2023-06-01",
     },
@@ -1322,6 +1327,10 @@ app.post("/api/ai/chat", async (req, res) => {
 /* =========================
    Start
 ========================= */
+console.log("[AI PROXY] anthropic-messages compatible, gzip/deflate decode enabled");
 app.listen(PORT, () => {
   console.log(`[NEON QUANT backend] listening on :${PORT} build=${BUILD_ID} tz=${TZ}`);
 });
+
+// [PATCH_MARK] anthropic-compat build
+
