@@ -12,22 +12,28 @@ import zlib from "zlib";
 
 const app = express();
 
-// ---- CORS (GitHub Pages -> Render) ----
-// Use explicit options so Firefox/Safari won't report opaque NetworkError on preflight failures.
-const corsOptions = {
-  origin: true, // reflect requesting origin
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-  maxAge: 86400,
-};
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions));
-
-// If any proxy/CDN strips OPTIONS handling, ensure we always end preflight cleanly.
+// ---- CORS (fix for Firefox "CORS request did not succeed") ----
+// We respond to *all* requests (including errors) with CORS headers,
+// and we handle OPTIONS preflight without redirects.
+//
+// If you want to lock this down later, replace "*" with your frontend origin.
 app.use((req, res, next) => {
-  if (req.method === "OPTIONS") return res.status(204).end();
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Api-Key, Anthropic-Version, anthropic-version, x-api-key"
+  );
+  // If you ever use cookies, also add:
+  // res.setHeader("Access-Control-Allow-Credentials", "true");
+  if (req.method === "OPTIONS") return res.status(200).end();
   next();
 });
+
+// Keep cors() as a secondary layer (some platforms normalize headers).
+app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
+
 
 app.use(express.json({ limit: "6mb" }));
 
